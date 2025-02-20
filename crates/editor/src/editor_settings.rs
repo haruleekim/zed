@@ -58,6 +58,7 @@ pub struct EditorSettings {
     pub drag_and_drop_selection: DragAndDropSelection,
     pub lsp_document_colors: DocumentColorsRenderMode,
     pub minimum_contrast_for_highlights: f32,
+    pub inline_modal_editing: bool,
 }
 #[derive(Debug, Clone)]
 pub struct Jupyter {
@@ -286,6 +287,7 @@ impl Settings for EditorSettings {
             },
             lsp_document_colors: editor.lsp_document_colors.unwrap(),
             minimum_contrast_for_highlights: editor.minimum_contrast_for_highlights.unwrap(),
+            inline_modal_editing: editor.inline_modal_editing.unwrap(),
         }
     }
 

@@ -1266,23 +1266,33 @@ impl Vim {
         let editor = editor.read(cx);
         let editor_mode = editor.mode();
 
-        if editor_mode.is_full()
-            && !newest_selection_empty
-            && self.mode == Mode::Normal
-            // When following someone, don't switch vim mode.
-            && editor.leader_id().is_none()
-        {
-            if preserve_selection {
-                self.switch_mode(Mode::Visual, true, window, cx);
-            } else {
-                self.update_editor(cx, |_, editor, cx| {
-                    editor.set_clip_at_line_ends(false, cx);
-                    editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                        s.move_with(|_, selection| {
-                            selection.collapse_to(selection.start, selection.goal)
-                        })
-                    });
-                });
+        // When following someone, don't switch vim mode.
+        if editor.leader_id().is_none() {
+            use editor::EditorMode;
+            match editor_mode {
+                EditorMode::Full { .. } if !newest_selection_empty && self.mode == Mode::Normal => {
+                    if preserve_selection {
+                        self.switch_mode(Mode::Visual, true, window, cx);
+                    } else {
+                        self.update_editor(cx, |_, editor, cx| {
+                            editor.set_clip_at_line_ends(false, cx);
+                            editor.change_selections(
+                                SelectionEffects::no_scroll(),
+                                window,
+                                cx,
+                                |s| {
+                                    s.move_with(|_, selection| {
+                                        selection.collapse_to(selection.start, selection.goal)
+                                    })
+                                },
+                            );
+                        });
+                    }
+                }
+                EditorMode::SingleLine { .. } | EditorMode::AutoHeight { .. } => {
+                    self.switch_mode(Mode::Insert, true, window, cx);
+                }
+                _ => {}
             }
         }
 

@@ -191,6 +191,11 @@ pub struct EditorSettingsContent {
     ///
     /// Default: [`DocumentColorsRenderMode::Inlay`]
     pub lsp_document_colors: Option<DocumentColorsRenderMode>,
+
+    /// Enable vim/helix mode in inline editor.
+    ///
+    /// Default: false
+    pub inline_modal_editing: Option<bool>,
 }
 
 // Status bar related settings

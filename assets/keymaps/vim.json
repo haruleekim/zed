@@ -1,6 +1,6 @@
 [
   {
-    "context": "VimControl && !menu",
+    "context": "VimControl && (!menu || !!editing)",
     "bindings": {
       "i": ["vim::PushObject", { "around": false }],
       "a": ["vim::PushObject", { "around": true }],
@@ -387,7 +387,7 @@
     }
   },
   {
-    "context": "(vim_mode == normal || vim_mode == helix_normal) && !menu",
+    "context": "(vim_mode == normal || vim_mode == helix_normal) && (!menu || !!editing)",
     "bindings": {
       "escape": "editor::Cancel",
       "shift-d": "vim::DeleteToEndOfLine",
@@ -413,7 +413,7 @@
     }
   },
   {
-    "context": "vim_mode == helix_normal && !menu",
+    "context": "vim_mode == helix_normal && (!menu || !!editing)",
     "bindings": {
       "i": "vim::HelixInsert",
       "a": "vim::HelixAppend",
@@ -706,7 +706,7 @@
     "bindings": {
       "y": "vim::CurrentLine",
       "v": "vim::PushForcedMotion",
-      "s": ["vim::PushAddSurrounds", {}]
+      "s": "vim::PushAddSurrounds"
     }
   },
   {

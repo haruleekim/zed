@@ -2153,7 +2153,7 @@ impl Editor {
             collapse_matches: false,
             workspace: None,
             input_enabled: !is_minimap,
-            use_modal_editing: full_mode,
+            use_modal_editing: full_mode || EditorSettings::get_global(&cx).inline_modal_editing,
             read_only: is_minimap,
             use_autoclose: true,
             use_auto_surround: true,
