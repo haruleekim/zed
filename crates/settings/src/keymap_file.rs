@@ -73,6 +73,10 @@ pub struct KeymapSection {
     /// on macOS. See the documentation for more details.
     #[serde(default)]
     use_key_equivalents: bool,
+    /// Allows the bindings to override the default IME behavior.
+    /// This is currently only supported on macOS.
+    #[serde(default)]
+    override_ime: bool,
     /// This keymap section's bindings, as a JSON object mapping keystrokes to actions. The
     /// keystrokes key is a string representing a sequence of keystrokes to type, where the
     /// keystrokes are separated by whitespace. Each keystroke is a sequence of modifiers (`ctrl`,
@@ -231,6 +235,7 @@ impl KeymapFile {
         for KeymapSection {
             context,
             use_key_equivalents,
+            override_ime,
             bindings,
             unrecognized_fields,
         } in keymap_file.0.iter()
@@ -270,6 +275,7 @@ impl KeymapFile {
                         action,
                         context_predicate.clone(),
                         *use_key_equivalents,
+                        *override_ime,
                         cx,
                     );
                     match result {
@@ -330,6 +336,7 @@ impl KeymapFile {
         action: &KeymapAction,
         context: Option<Rc<KeyBindingContextPredicate>>,
         use_key_equivalents: bool,
+        override_ime: bool,
         cx: &App,
     ) -> std::result::Result<KeyBinding, String> {
         let (action, action_input_string) = Self::build_keymap_action(action, cx)?;
@@ -339,6 +346,7 @@ impl KeymapFile {
             action,
             context,
             use_key_equivalents,
+            override_ime,
             action_input_string.map(SharedString::from),
             cx.keyboard_mapper().as_ref(),
         ) {
