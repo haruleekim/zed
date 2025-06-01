@@ -1873,10 +1873,11 @@ pub(crate) fn next_subword_end(
     for _ in 0..times {
         let new_point = next_char(map, point, allow_cross_newline);
 
-        let mut crossed_newline = false;
-        let mut need_backtrack = false;
-        let new_point =
-            movement::find_boundary(map, new_point, FindRange::MultiLine, |left, right| {
+        let new_point = movement::find_boundary_exclusive(
+            map,
+            new_point,
+            FindRange::MultiLine,
+            |left, right| {
                 let left_kind = classifier.kind(left);
                 let right_kind = classifier.kind(right);
                 let at_newline = right == '\n';
@@ -1889,19 +1890,11 @@ pub(crate) fn next_subword_end(
                 let is_subword_end =
                     left != '_' && right == '_' || left.is_lowercase() && right.is_uppercase();
 
-                let found = !left.is_whitespace() && !at_newline && (is_word_end || is_subword_end);
+                let found = !left.is_whitespace() && (is_word_end || is_subword_end);
 
-                if found && (is_word_end || is_subword_end) {
-                    need_backtrack = true;
-                }
-
-                crossed_newline |= at_newline;
                 found
-            });
-        let mut new_point = map.clip_point(new_point, Bias::Left);
-        if need_backtrack {
-            *new_point.column_mut() -= 1;
-        }
+            },
+        );
         let new_point = map.clip_point(new_point, Bias::Left);
         if point == new_point {
             break;
@@ -3530,6 +3523,87 @@ mod test {
         cx.set_shared_state(initial_state).await;
         cx.simulate_shared_keystrokes("}").await;
         cx.shared_state().await.assert_eq("something(fooˇ)");
+    }
+
+    #[gpui::test]
+    async fn test_next_subword_end(cx: &mut gpui::TestAppContext) {
+        #[track_caller]
+        fn assert_state<'a>(cx: &mut VimTestContext, before: &str, after: &'a str) -> &'a str {
+            cx.set_state(before, Mode::Normal);
+            cx.dispatch_action(super::NextSubwordEnd {
+                ignore_punctuation: false,
+            });
+            cx.assert_state(after, Mode::Normal);
+            after
+        }
+
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        assert_state(&mut cx, "abcˇ camelCasedWord", "abc cameˇlCasedWord");
+        assert_state(&mut cx, "abc ˇcamelCasedWord", "abc cameˇlCasedWord");
+        assert_state(&mut cx, "abc cˇamelCasedWord", "abc cameˇlCasedWord");
+        assert_state(&mut cx, "abc camˇelCasedWord", "abc cameˇlCasedWord");
+        assert_state(&mut cx, "abc cameˇlCasedWord", "abc camelCaseˇdWord");
+        assert_state(&mut cx, "abc camelˇCasedWord", "abc camelCaseˇdWord");
+
+        assert_state(&mut cx, "abcˇ snake_cased_word", "abc snakˇe_cased_word");
+        assert_state(&mut cx, "abc ˇsnake_cased_word", "abc snakˇe_cased_word");
+        assert_state(&mut cx, "abc sˇnake_cased_word", "abc snakˇe_cased_word");
+        assert_state(&mut cx, "abc snaˇke_cased_word", "abc snakˇe_cased_word");
+        assert_state(&mut cx, "abc snakˇe_cased_word", "abc snake_caseˇd_word");
+        assert_state(&mut cx, "abc snakeˇ_cased_word", "abc snake_caseˇd_word");
+
+        assert_state(&mut cx, "abcˇ SNAKE_CASED_WORD", "abc SNAKˇE_CASED_WORD");
+        assert_state(&mut cx, "abc ˇSNAKE_CASED_WORD", "abc SNAKˇE_CASED_WORD");
+        assert_state(&mut cx, "abc SˇNAKE_CASED_WORD", "abc SNAKˇE_CASED_WORD");
+        assert_state(&mut cx, "abc SNAˇKE_CASED_WORD", "abc SNAKˇE_CASED_WORD");
+        assert_state(&mut cx, "abc SNAKˇE_CASED_WORD", "abc SNAKE_CASEˇD_WORD");
+        assert_state(&mut cx, "abc SNAKEˇ_CASED_WORD", "abc SNAKE_CASEˇD_WORD");
+
+        [
+            "local ˇmyVariableName = FOO_BAR_BAZ",
+            "local mˇyVariableName = FOO_BAR_BAZ",
+            "local myVariablˇeName = FOO_BAR_BAZ",
+            "local myVariableNamˇe = FOO_BAR_BAZ",
+            "local myVariableName ˇ= FOO_BAR_BAZ",
+            "local myVariableName = FOˇO_BAR_BAZ",
+            "local myVariableName = FOO_BAˇR_BAZ",
+            "local myVariableName = FOO_BAR_BAˇZ",
+        ]
+        .into_iter()
+        .reduce(|before, after| assert_state(&mut cx, before, after));
+
+        [
+            "ˇfoo == bar .. 'baz'",
+            "foˇo == bar .. 'baz'",
+            "foo =ˇ= bar .. 'baz'",
+            "foo == baˇr .. 'baz'",
+            "foo == bar .ˇ. 'baz'",
+            "foo == bar .. 'baˇz'",
+        ]
+        .into_iter()
+        .reduce(|before, after| assert_state(&mut cx, before, after));
+
+        [
+            "ˇfoo:find('a')",
+            "foˇo:find('a')",
+            "foo:finˇd('a')",
+            "foo:find('ˇa')",
+        ]
+        .into_iter()
+        .reduce(|before, after| assert_state(&mut cx, before, after));
+
+        [
+            "aˇ\n\n\nabcdef\ngh_ij",
+            "a\n\n\nabcdeˇf\ngh_ij",
+            "a\n\n\nabcdef\ngˇh_ij",
+            "a\n\n\nabcdef\ngh_iˇj",
+        ]
+        .into_iter()
+        .reduce(|before, after| assert_state(&mut cx, before, after));
+
+        assert_state(&mut cx, "ˇabc\ndef", "abˇc\ndef");
+        assert_state(&mut cx, "abˇc\ndef", "abc\ndeˇf");
     }
 
     #[gpui::test]
