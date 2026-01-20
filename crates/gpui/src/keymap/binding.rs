@@ -14,6 +14,7 @@ pub struct KeyBinding {
     pub(crate) meta: Option<KeyBindingMetaIndex>,
     /// The json input string used when building the keybinding, if any
     pub(crate) action_input: Option<SharedString>,
+    pub(crate) override_ime: bool,
 }
 
 impl Clone for KeyBinding {
@@ -24,6 +25,7 @@ impl Clone for KeyBinding {
             context_predicate: self.context_predicate.clone(),
             meta: self.meta,
             action_input: self.action_input.clone(),
+            override_ime: self.override_ime,
         }
     }
 }
@@ -38,6 +40,7 @@ impl KeyBinding {
             Box::new(action),
             context_predicate,
             false,
+            false,
             None,
             &DummyKeyboardMapper,
         )
@@ -50,6 +53,7 @@ impl KeyBinding {
         action: Box<dyn Action>,
         context_predicate: Option<Rc<KeyBindingContextPredicate>>,
         use_key_equivalents: bool,
+        override_ime: bool,
         action_input: Option<SharedString>,
         keyboard_mapper: &dyn PlatformKeyboardMapper,
     ) -> std::result::Result<Self, InvalidKeystrokeError> {
@@ -71,6 +75,7 @@ impl KeyBinding {
             context_predicate,
             meta: None,
             action_input,
+            override_ime,
         })
     }
 
@@ -88,6 +93,15 @@ impl KeyBinding {
     /// Check if the given keystrokes match this binding.
     pub fn match_keystrokes(&self, typed: &[impl AsKeystroke]) -> Option<bool> {
         if self.keystrokes.len() < typed.len() {
+            return None;
+        }
+
+        if !self.override_ime
+            && typed
+                .iter()
+                .map(AsKeystroke::as_keystroke)
+                .any(|key| key.is_composing == Some(true))
+        {
             return None;
         }
 
@@ -131,6 +145,7 @@ impl std::fmt::Debug for KeyBinding {
         f.debug_struct("KeyBinding")
             .field("keystrokes", &self.keystrokes)
             .field("context_predicate", &self.context_predicate)
+            .field("override_ime", &self.override_ime)
             .field("action", &self.action.name())
             .finish()
     }

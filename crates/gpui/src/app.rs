@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow};
+use better_refcell::BetterRefCell;
 use derive_more::{Deref, DerefMut};
 use futures::{
     Future, FutureExt,
@@ -64,7 +65,7 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
 /// Strongly consider removing after stabilization.
 #[doc(hidden)]
 pub struct AppCell {
-    app: RefCell<App>,
+    app: BetterRefCell<App>,
 }
 
 impl AppCell {
@@ -96,6 +97,18 @@ impl AppCell {
             eprintln!("borrowed {thread_id:?}");
         }
         Ok(AppRefMut(self.app.try_borrow_mut()?))
+    }
+
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn unborrow<R>(&self, borrowed: &mut App, f: impl FnOnce() -> R) -> R {
+        self.app.unborrow(borrowed, f)
+    }
+
+    #[doc(hidden)]
+    #[track_caller]
+    pub fn unborrow_ref<R>(&self, borrowed: &App, f: impl FnOnce() -> R) -> R {
+        self.app.unborrow_ref(borrowed, f)
     }
 }
 
@@ -601,7 +614,7 @@ pub struct App {
     pub(crate) entities: EntityMap,
     pub(crate) window_update_stack: Vec<WindowId>,
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
-    pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
+    pub(crate) windows: SlotMap<WindowId, Option<Rc<BetterRefCell<Window>>>>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
     pub(crate) focus_handles: Arc<FocusMap>,
     pub(crate) keymap: Rc<RefCell<Keymap>>,
@@ -664,7 +677,7 @@ impl App {
         let keyboard_mapper = platform.keyboard_mapper();
 
         let app = Rc::new_cyclic(|this| AppCell {
-            app: RefCell::new(App {
+            app: BetterRefCell::new(App {
                 this: this.clone(),
                 platform: platform.clone(),
                 text_system,
@@ -1021,7 +1034,10 @@ impl App {
                     clear.clear();
 
                     cx.window_handles.insert(id, window.handle);
-                    cx.windows.get_mut(id).unwrap().replace(Box::new(window));
+                    cx.windows
+                        .get_mut(id)
+                        .unwrap()
+                        .replace(Rc::new(BetterRefCell::new(window)));
                     Ok(handle)
                 }
                 Err(e) => {
@@ -1332,7 +1348,7 @@ impl App {
                     .windows
                     .values()
                     .filter_map(|window| {
-                        let window = window.as_deref()?;
+                        let window = window.as_ref()?.borrow();
                         window.invalidator.is_dirty().then_some(window.handle)
                     })
                     .collect::<Vec<_>>()
@@ -1413,7 +1429,10 @@ impl App {
 
     fn apply_refresh_effect(&mut self) {
         for window in self.windows.values_mut() {
-            if let Some(window) = window.as_deref_mut() {
+            if let Some(mut window) = window
+                .as_deref()
+                .and_then(|window| window.try_borrow_mut().ok())
+            {
                 window.refreshing = true;
                 window.invalidator.set_dirty(true);
             }
@@ -1456,7 +1475,10 @@ impl App {
         F: FnOnce(AnyView, &mut Window, &mut App) -> T,
     {
         self.update(|cx| {
-            let mut window = cx.windows.get_mut(id)?.take()?;
+            let mut window = cx.windows.get_mut(id)?.clone();
+            let mut window = window
+                .as_mut()
+                .and_then(|window| window.try_borrow_mut().ok())?;
 
             let root_view = window.root.clone().unwrap();
 
@@ -1482,8 +1504,6 @@ impl App {
                 if quit_on_empty && cx.windows.is_empty() {
                     cx.quit();
                 }
-            } else {
-                cx.windows.get_mut(id)?.replace(window);
             }
 
             Some(result)
@@ -2198,7 +2218,11 @@ impl App {
     /// This is a no-op if the image is not in the sprite atlas.
     pub fn drop_image(&mut self, image: Arc<RenderImage>, current_window: Option<&mut Window>) {
         // remove the texture from all other windows
-        for window in self.windows.values_mut().flatten() {
+        for mut window in self
+            .windows
+            .values_mut()
+            .filter_map(|window| window.as_mut()?.try_borrow_mut().ok())
+        {
             _ = window.drop_image(image.clone());
         }
 
@@ -2321,7 +2345,8 @@ impl AppContext for App {
             .windows
             .get(window.id)
             .context("window not found")?
-            .as_deref()
+            .as_ref()
+            .and_then(|window| window.try_borrow().ok())
             .expect("attempted to read a window that is already on the stack");
 
         let root_view = window.root.clone().unwrap();
