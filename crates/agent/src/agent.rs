@@ -776,13 +776,14 @@ impl NativeAgent {
             )
         });
 
-        self.register_session(thread, project_id, 1, cx)
+        self.register_session(thread, project_id, None, 1, cx)
     }
 
     fn register_session(
         &mut self,
         thread_handle: Entity<Thread>,
         project_id: EntityId,
+        parent_session_id: Option<acp::SessionId>,
         ref_count: usize,
         cx: &mut Context<Self>,
     ) -> Entity<AcpThread> {
@@ -790,7 +791,7 @@ impl NativeAgent {
 
         let thread = thread_handle.read(cx);
         let session_id = thread.id().clone();
-        let parent_session_id = thread.parent_thread_id();
+        let parent_session_id = thread.parent_thread_id().or(parent_session_id);
         let title = thread.title();
         let draft_prompt = thread.draft_prompt().map(Vec::from);
         let scroll_position = thread.ui_scroll_position();
@@ -1659,6 +1660,7 @@ impl NativeAgent {
         &mut self,
         id: acp::SessionId,
         project: Entity<Project>,
+        parent_session_id: Option<acp::SessionId>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<AcpThread>>> {
         if let Some(session) = self.sessions.get_mut(&id) {
@@ -1694,7 +1696,13 @@ impl NativeAgent {
                                 .pending_sessions
                                 .remove(&id)
                                 .map_or(1, |pending| pending.ref_count);
-                            this.register_session(thread.clone(), project_id, ref_count, cx)
+                            this.register_session(
+                                thread.clone(),
+                                project_id,
+                                parent_session_id,
+                                ref_count,
+                                cx,
+                            )
                         })
                         .map_err(Arc::new)?;
                     let events = thread.update(cx, |thread, cx| thread.replay(cx));
@@ -1732,7 +1740,7 @@ impl NativeAgent {
         project: Entity<Project>,
         cx: &mut Context<Self>,
     ) -> Task<Result<SharedString>> {
-        let thread = self.open_thread(id.clone(), project, cx);
+        let thread = self.open_thread(id.clone(), project, None, cx);
         cx.spawn(async move |this, cx| {
             let acp_thread = thread.await?;
             let result = this
@@ -2716,11 +2724,13 @@ impl acp_thread::AgentConnection for NativeAgentConnection {
         session_id: acp::SessionId,
         project: Entity<Project>,
         _work_dirs: PathList,
+        parent_session_id: Option<acp::SessionId>,
         _title: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Entity<acp_thread::AcpThread>>> {
-        self.0
-            .update(cx, |agent, cx| agent.open_thread(session_id, project, cx))
+        self.0.update(cx, |agent, cx| {
+            agent.open_thread(session_id, project, parent_session_id, cx)
+        })
     }
 
     fn supports_close_session(&self) -> bool {
@@ -3192,7 +3202,7 @@ impl NativeThreadEnvironment {
                     .get(&parent_session_id)
                     .map(|s| s.project_id)
                     .context("parent session not found")?;
-                Ok(agent.register_session(subagent_thread.clone(), project_id, 1, cx))
+                Ok(agent.register_session(subagent_thread.clone(), project_id, None, 1, cx))
             })??;
 
         let depth = current_depth + 1;
@@ -5249,7 +5259,7 @@ mod internal_tests {
         // Run the subagent through the production registration path.
         // This is what installs the `SkillTool` on the thread.
         let _subagent_acp = agent.update(cx, |agent, cx| {
-            agent.register_session(subagent_thread.clone(), parent_project_id, 1, cx)
+            agent.register_session(subagent_thread.clone(), parent_project_id, None, 1, cx)
         });
 
         // Verify the subagent thread has the `SkillTool` installed —
@@ -5276,6 +5286,48 @@ mod internal_tests {
                 .collect();
             assert_eq!(subagent_skills.len(), 1);
             assert_eq!(subagent_skills[0].name, "shared-skill");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_register_session_preserves_persisted_parent_over_conflicting_hint(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let thread_store = cx.new(|cx| ThreadStore::new(cx));
+        let agent =
+            cx.update(|cx| NativeAgent::new(thread_store, Templates::new(), fs.clone(), cx));
+        let parent_acp = cx
+            .update(|cx| {
+                Rc::new(NativeAgentConnection(agent.clone())).new_session(
+                    project,
+                    PathList::new(&[Path::new("/")]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let persisted_parent_id =
+            parent_acp.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let (parent_thread, project_id) = agent.read_with(cx, |agent, _cx| {
+            let session = agent.sessions.get(&persisted_parent_id).unwrap();
+            (session.thread.clone(), session.project_id)
+        });
+        let subagent_thread = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent_thread, cx)));
+        let registered = agent.update(cx, |agent, cx| {
+            agent.register_session(
+                subagent_thread,
+                project_id,
+                Some(acp::SessionId::new("conflicting-parent")),
+                1,
+                cx,
+            )
+        });
+
+        registered.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.parent_session_id(), Some(&persisted_parent_id));
         });
     }
 
@@ -6176,7 +6228,7 @@ mod internal_tests {
         // Reload the thread and verify thinking_enabled is still true.
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -6279,7 +6331,7 @@ mod internal_tests {
         // Reload the thread and verify the model was preserved.
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -6393,7 +6445,7 @@ mod internal_tests {
 
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -6446,7 +6498,7 @@ mod internal_tests {
 
         let reloaded_acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -6643,7 +6695,7 @@ mod internal_tests {
         );
         let acp_thread = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -6754,7 +6806,7 @@ mod internal_tests {
         // Reopen and verify the draft prompt was saved.
         let reloaded = agent
             .update(cx, |agent, cx| {
-                agent.open_thread(session_id.clone(), project.clone(), cx)
+                agent.open_thread(session_id.clone(), project.clone(), None, cx)
             })
             .await
             .unwrap();
@@ -7008,6 +7060,7 @@ mod internal_tests {
                 project.clone(),
                 PathList::new(&[Path::new("")]),
                 None,
+                None,
                 cx,
             )
         });
@@ -7016,6 +7069,7 @@ mod internal_tests {
                 session_id.clone(),
                 project.clone(),
                 PathList::new(&[Path::new("")]),
+                None,
                 None,
                 cx,
             )

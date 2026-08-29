@@ -2102,6 +2102,7 @@ pub struct AcpThread {
     shared_buffers: HashMap<Entity<Buffer>, BufferSnapshot>,
     turn_id: u32,
     running_turn: Option<RunningTurn>,
+    external_subagent_running: bool,
     connection: Rc<dyn AgentConnection>,
     token_usage: Option<TokenUsage>,
     cost: Option<SessionCost>,
@@ -2313,6 +2314,7 @@ impl AcpThread {
             provisional_title: None,
             project,
             running_turn: None,
+            external_subagent_running: false,
             turn_id: 0,
             connection,
             session_id,
@@ -2333,6 +2335,17 @@ impl AcpThread {
 
     pub fn parent_session_id(&self) -> Option<&acp::SessionId> {
         self.parent_session_id.as_ref()
+    }
+
+    pub fn promote_parent_session_id(&mut self, parent_session_id: Option<acp::SessionId>) {
+        let Some(parent_session_id) = parent_session_id else {
+            return;
+        };
+        match &self.parent_session_id {
+            None => self.parent_session_id = Some(parent_session_id),
+            Some(existing_parent) if existing_parent == &parent_session_id => {}
+            Some(_) => {}
+        }
     }
 
     pub fn prompt_capabilities(&self) -> acp::PromptCapabilities {
@@ -2441,10 +2454,26 @@ impl AcpThread {
     }
 
     pub fn status(&self) -> ThreadStatus {
-        if self.running_turn.is_some() {
+        if self.running_turn.is_some() || self.external_subagent_running {
             ThreadStatus::Generating
         } else {
             ThreadStatus::Idle
+        }
+    }
+
+    pub fn set_external_subagent_running(&mut self, running: bool, cx: &mut Context<Self>) {
+        if self.external_subagent_running == running {
+            return;
+        }
+
+        let previous_status = self.status();
+        let stopped = self.external_subagent_running && !running;
+        self.external_subagent_running = running;
+        if self.status() != previous_status {
+            cx.emit(AcpThreadEvent::StatusChanged);
+        }
+        if stopped {
+            cx.emit(AcpThreadEvent::Stopped(acp::StopReason::EndTurn));
         }
     }
 
@@ -3910,15 +3939,23 @@ impl AcpThread {
         Self::flush_streaming_text(&mut self.streaming_text_buffer, cx);
         self.cancel_outstanding_elicitations(cx);
 
-        let Some(turn) = self.running_turn.take() else {
+        let previous_status = self.status();
+        let turn = self.running_turn.take();
+        if turn.is_none() && self.parent_session_id.is_none() {
             return Task::ready(());
-        };
+        }
+
         self.mark_pending_entries_as_canceled(permission_outcome, cx);
         self.connection.cancel(&self.session_id, cx);
-        cx.emit(AcpThreadEvent::StatusChanged);
+        if self.status() != previous_status {
+            cx.emit(AcpThreadEvent::StatusChanged);
+        }
 
-        // Wait for the send task to complete
-        cx.background_spawn(turn.send_task)
+        if let Some(turn) = turn {
+            cx.background_spawn(turn.send_task)
+        } else {
+            Task::ready(())
+        }
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
@@ -7428,6 +7465,116 @@ mod tests {
         .unwrap()
     }
 
+    #[gpui::test]
+    async fn test_parent_session_promotion_never_demotes_or_reparents(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let first_parent = acp::SessionId::new("first-parent");
+        let different_parent = acp::SessionId::new("different-parent");
+
+        thread.update(cx, |thread, _cx| {
+            thread.promote_parent_session_id(None);
+            assert!(thread.parent_session_id().is_none());
+
+            thread.promote_parent_session_id(Some(first_parent.clone()));
+            assert_eq!(thread.parent_session_id(), Some(&first_parent));
+
+            thread.promote_parent_session_id(None);
+            thread.promote_parent_session_id(Some(first_parent.clone()));
+            thread.promote_parent_session_id(Some(different_parent));
+            assert_eq!(thread.parent_session_id(), Some(&first_parent));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_external_subagent_running_emits_status_and_stopped_events(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            let events = events.clone();
+            cx.subscribe(&thread, move |_thread, event, _cx| {
+                let event = match event {
+                    AcpThreadEvent::StatusChanged => Some("status"),
+                    AcpThreadEvent::Stopped(acp::StopReason::EndTurn) => Some("stopped_end_turn"),
+                    AcpThreadEvent::Stopped(_) => Some("stopped_other"),
+                    _ => None,
+                };
+                if let Some(event) = event {
+                    events.borrow_mut().push(event);
+                }
+            })
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_external_subagent_running(true, cx);
+            thread.set_external_subagent_running(true, cx);
+        });
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+        });
+        thread.update(cx, |thread, cx| {
+            thread.set_external_subagent_running(false, cx);
+        });
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
+        assert_eq!(
+            events.borrow().as_slice(),
+            ["status", "status", "stopped_end_turn"]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_child_cancel_without_local_turn_cancels_entries_and_connection(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let child_session_id = thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let tool_call_id = acp::ToolCallId::new("pending-child-tool");
+        thread
+            .update(cx, |thread, cx| {
+                thread.promote_parent_session_id(Some(acp::SessionId::new("parent")));
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Pending child tool")
+                            .status(acp::ToolCallStatus::Pending),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread.tool_call(&tool_call_id).unwrap();
+            assert!(matches!(tool_call.status, ToolCallStatus::Canceled));
+        });
+        assert_eq!(
+            connection.cancelled_sessions.borrow().as_slice(),
+            [child_session_id]
+        );
+    }
+
     fn only_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {
         let [entry] = thread.entries() else {
             panic!("expected one elicitation entry, got {:?}", thread.entries());
@@ -8756,6 +8903,7 @@ mod tests {
         supports_truncate: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp::SessionId, WeakEntity<AcpThread>>>>,
         set_title_calls: Rc<RefCell<Vec<SharedString>>>,
+        cancelled_sessions: Rc<RefCell<Vec<acp::SessionId>>>,
         on_user_message: Option<
             Rc<
                 dyn Fn(
@@ -8776,6 +8924,7 @@ mod tests {
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
+                cancelled_sessions: Default::default(),
             }
         }
 
@@ -8888,7 +9037,11 @@ mod tests {
             })
         }
 
-        fn cancel(&self, _session_id: &acp::SessionId, _cx: &mut App) {}
+        fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
+            self.cancelled_sessions
+                .borrow_mut()
+                .push(session_id.clone());
+        }
 
         fn truncate(
             &self,

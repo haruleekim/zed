@@ -6991,6 +6991,7 @@ mod tests {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Entity<AcpThread> {
@@ -6999,7 +7000,7 @@ mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             cx.new(|cx| {
                 AcpThread::new(
-                    None,
+                    parent_session_id,
                     title,
                     Some(work_dirs),
                     self,
@@ -7042,7 +7043,7 @@ mod tests {
                 *next_session_number += 1;
                 session_id
             };
-            let thread = self.create_session(session_id, project, work_dirs, None, cx);
+            let thread = self.create_session(session_id, project, work_dirs, None, None, cx);
             Task::ready(Ok(thread))
         }
 
@@ -7055,10 +7056,12 @@ mod tests {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
-            let thread = self.create_session(session_id, project, work_dirs, title, cx);
+            let thread =
+                self.create_session(session_id, project, work_dirs, parent_session_id, title, cx);
             thread.update(cx, |thread, cx| {
                 thread
                     .handle_session_update(
@@ -13204,6 +13207,7 @@ mod tests {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Entity<AcpThread> {
@@ -13212,7 +13216,7 @@ mod tests {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             cx.new(|cx| {
                 AcpThread::new(
-                    None,
+                    parent_session_id,
                     title,
                     Some(work_dirs),
                     self,
@@ -13255,7 +13259,7 @@ mod tests {
                 *next_session_number += 1;
                 session_id
             };
-            let thread = self.create_session(session_id, project, work_dirs, None, cx);
+            let thread = self.create_session(session_id, project, work_dirs, None, None, cx);
             Task::ready(Ok(thread))
         }
 
@@ -13268,10 +13272,12 @@ mod tests {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
-            let thread = self.create_session(session_id, project, work_dirs, title, cx);
+            let thread =
+                self.create_session(session_id, project, work_dirs, parent_session_id, title, cx);
             thread.update(cx, |thread, cx| {
                 thread
                     .handle_session_update(

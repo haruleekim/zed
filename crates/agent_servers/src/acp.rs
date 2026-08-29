@@ -1,6 +1,6 @@
 use acp_thread::{
     AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore,
+    AgentSessionListResponse, ElicitationStore, subagent_session_info_from_meta,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
@@ -768,6 +768,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
     let mut meta = acp::Meta::from_iter([
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
+        ("subagent_session_info".into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -1168,6 +1169,7 @@ impl AcpConnection {
         session_id: acp::SessionId,
         project: Entity<Project>,
         work_dirs: PathList,
+        parent_session_id: Option<acp::SessionId>,
         title: Option<SharedString>,
         rpc_call: impl FnOnce(
             ConnectionTo<Agent>,
@@ -1187,14 +1189,21 @@ impl AcpConnection {
         if let Some(pending) = self.pending_sessions.borrow_mut().get_mut(&session_id) {
             pending.ref_count += 1;
             let task = pending.task.clone();
-            return cx
-                .foreground_executor()
-                .spawn(async move { task.await.map_err(|err| anyhow!(err)) });
+            return cx.spawn(async move |cx| {
+                let thread = task.await.map_err(|err| anyhow!(err))?;
+                thread.update(cx, |thread, _cx| {
+                    thread.promote_parent_session_id(parent_session_id);
+                });
+                Ok(thread)
+            });
         }
 
         if let Some(session) = self.sessions.borrow_mut().get_mut(&session_id) {
             session.ref_count += 1;
             if let Some(thread) = session.thread.upgrade() {
+                thread.update(cx, |thread, _cx| {
+                    thread.promote_parent_session_id(parent_session_id.clone());
+                });
                 return Task::ready(Ok(thread));
             }
         }
@@ -1212,7 +1221,7 @@ impl AcpConnection {
                     let action_log = cx.new(|_| ActionLog::new(project.clone()));
                     let thread: Entity<AcpThread> = cx.new(|cx| {
                         AcpThread::new(
-                            None,
+                            parent_session_id,
                             title,
                             Some(work_dirs),
                             this.clone(),
@@ -1731,6 +1740,7 @@ impl AgentConnection for AcpConnection {
         session_id: acp::SessionId,
         project: Entity<Project>,
         work_dirs: PathList,
+        parent_session_id: Option<acp::SessionId>,
         title: Option<SharedString>,
         cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
@@ -1745,6 +1755,7 @@ impl AgentConnection for AcpConnection {
             session_id,
             project,
             work_dirs,
+            parent_session_id,
             title,
             move |connection, session_id, directories| {
                 Box::pin(async move {
@@ -1789,6 +1800,7 @@ impl AgentConnection for AcpConnection {
             session_id,
             project,
             work_dirs,
+            None,
             title,
             move |connection, session_id, directories| {
                 Box::pin(async move {
@@ -2101,6 +2113,7 @@ pub mod test_support {
         load_session_count: Arc<AtomicUsize>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
+        next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
         auth_elicitation_request: Arc<Mutex<Option<acp::CreateElicitationRequest>>>,
         auth_elicitation_response:
             Arc<Mutex<Option<async_channel::Sender<acp::CreateElicitationResponse>>>>,
@@ -2136,6 +2149,13 @@ pub mod test_support {
 
         pub fn fail_next_prompt(&self) {
             self.fail_next_prompt.store(true, Ordering::SeqCst);
+        }
+
+        pub fn set_next_prompt_updates(&self, updates: Vec<acp::SessionUpdate>) {
+            *self
+                .next_prompt_updates
+                .lock()
+                .expect("next prompt updates lock should not be poisoned") = updates;
         }
 
         pub fn request_elicitation_during_auth(
@@ -2174,6 +2194,7 @@ pub mod test_support {
             let load_session_count = self.load_session_count.clone();
             let close_session_count = self.close_session_count.clone();
             let fail_next_prompt = self.fail_next_prompt.clone();
+            let next_prompt_updates = self.next_prompt_updates.clone();
             let auth_elicitation_request = self.auth_elicitation_request.clone();
             let auth_elicitation_response = self.auth_elicitation_response.clone();
             let auth_elicitation_completion = self.auth_elicitation_completion.clone();
@@ -2184,6 +2205,7 @@ pub mod test_support {
                     load_session_count,
                     close_session_count,
                     fail_next_prompt,
+                    next_prompt_updates,
                     auth_elicitation_request,
                     auth_elicitation_response,
                     auth_elicitation_completion,
@@ -2266,12 +2288,18 @@ pub mod test_support {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
-            self.inner
-                .clone()
-                .load_session(session_id, project, work_dirs, title, cx)
+            self.inner.clone().load_session(
+                session_id,
+                project,
+                work_dirs,
+                parent_session_id,
+                title,
+                cx,
+            )
         }
 
         fn supports_close_session(&self) -> bool {
@@ -2412,6 +2440,7 @@ pub mod test_support {
         load_session_count: Arc<AtomicUsize>,
         close_session_count: Arc<AtomicUsize>,
         fail_next_prompt: Arc<AtomicBool>,
+        next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
         auth_elicitation_request: Arc<Mutex<Option<acp::CreateElicitationRequest>>>,
         auth_elicitation_response: Arc<
             Mutex<Option<async_channel::Sender<acp::CreateElicitationResponse>>>,
@@ -2493,7 +2522,19 @@ pub mod test_support {
             .on_receive_request(
                 {
                     let fail_next_prompt = fail_next_prompt.clone();
-                    async move |_req: acp::PromptRequest, responder, _cx| {
+                    let next_prompt_updates = next_prompt_updates.clone();
+                    async move |req: acp::PromptRequest, responder, cx| {
+                        let updates = std::mem::take(
+                            &mut *next_prompt_updates
+                                .lock()
+                                .expect("next prompt updates lock should not be poisoned"),
+                        );
+                        for update in updates {
+                            cx.send_notification(acp::SessionNotification::new(
+                                req.session_id.clone(),
+                                update,
+                            ))?;
+                        }
                         if fail_next_prompt.swap(false, Ordering::SeqCst) {
                             responder.respond_with_error(acp::ErrorCode::InternalError.into())
                         } else {
@@ -2627,6 +2668,7 @@ pub mod test_support {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
@@ -2656,6 +2698,7 @@ pub mod test_support {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Some(request))),
             Arc::new(Mutex::new(Some(response_tx))),
             Arc::new(Mutex::new(None)),
@@ -2688,6 +2731,7 @@ pub mod test_support {
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicUsize::new(0)),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(Mutex::new(Vec::new())),
             Arc::new(Mutex::new(Some(request))),
             Arc::new(Mutex::new(Some(response_tx))),
             Arc::new(Mutex::new(Some(completion))),
@@ -2940,6 +2984,7 @@ mod tests {
                     project.clone(),
                     work_dirs.clone(),
                     None,
+                    None,
                     cx,
                 )
             })
@@ -2951,6 +2996,7 @@ mod tests {
                     acp::SessionId::new("session-2"),
                     project,
                     work_dirs,
+                    None,
                     None,
                     cx,
                 )
@@ -3036,6 +3082,21 @@ mod tests {
             .expect("expected client capabilities meta");
 
         assert!(!meta.contains_key(PARAMETERIZED_MODEL_PICKER_META_KEY));
+    }
+
+    #[test]
+    fn client_capabilities_include_subagent_session_info_meta() {
+        for agent_id in [AgentId::new("codex-acp"), AgentId::new(CURSOR_ID)] {
+            let capabilities = client_capabilities_for_agent(&agent_id);
+            let meta = capabilities
+                .meta
+                .expect("expected client capabilities meta");
+
+            assert_eq!(
+                meta.get("subagent_session_info"),
+                Some(&serde_json::json!(true))
+            );
+        }
     }
 
     #[test]
@@ -4057,6 +4118,7 @@ mod tests {
                 project.clone(),
                 work_dirs.clone(),
                 None,
+                None,
                 cx,
             )
         });
@@ -4065,6 +4127,7 @@ mod tests {
                 session_id.clone(),
                 project.clone(),
                 work_dirs.clone(),
+                None,
                 None,
                 cx,
             )
@@ -4079,6 +4142,9 @@ mod tests {
             second_thread.entity_id(),
             "concurrent loads for the same session should share one AcpThread"
         );
+        first_thread.read_with(cx, |thread, _cx| {
+            assert!(thread.parent_session_id().is_none());
+        });
         assert_eq!(
             load_count.load(Ordering::SeqCst),
             1,
@@ -4118,6 +4184,100 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_cached_and_pending_loads_promote_parent_session_id(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (
+            connection,
+            project,
+            _load_count,
+            _close_count,
+            _load_session_updates,
+            load_session_gate,
+            _keep_agent_alive,
+        ) = connect_fake_agent(cx).await;
+        let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
+
+        let cached_session_id = acp::SessionId::new("cached-parent-promotion");
+        let cached_thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    cached_session_id.clone(),
+                    project.clone(),
+                    work_dirs.clone(),
+                    None,
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("initial cached session load failed");
+        let cached_parent = acp::SessionId::new("cached-parent");
+        let promoted_cached_thread = cx
+            .update(|cx| {
+                connection.clone().load_session(
+                    cached_session_id,
+                    project.clone(),
+                    work_dirs.clone(),
+                    Some(cached_parent.clone()),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("cached session promotion failed");
+        assert_eq!(
+            cached_thread.entity_id(),
+            promoted_cached_thread.entity_id()
+        );
+        cached_thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.parent_session_id(), Some(&cached_parent));
+        });
+
+        let (gate_tx, gate_rx) = async_channel::bounded::<()>(1);
+        *load_session_gate
+            .lock()
+            .expect("load_session_gate mutex poisoned") = Some(gate_rx);
+        let pending_session_id = acp::SessionId::new("pending-parent-promotion");
+        let pending_load = cx.update(|cx| {
+            connection.clone().load_session(
+                pending_session_id.clone(),
+                project.clone(),
+                work_dirs.clone(),
+                None,
+                None,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+
+        let pending_parent = acp::SessionId::new("pending-parent");
+        let promoted_pending_load = cx.update(|cx| {
+            connection.clone().load_session(
+                pending_session_id,
+                project,
+                work_dirs,
+                Some(pending_parent.clone()),
+                None,
+                cx,
+            )
+        });
+        gate_tx.send(()).await.expect("load gate should be open");
+
+        let pending_thread = pending_load.await.expect("pending session load failed");
+        let promoted_pending_thread = promoted_pending_load
+            .await
+            .expect("pending session promotion failed");
+        assert_eq!(
+            pending_thread.entity_id(),
+            promoted_pending_thread.entity_id()
+        );
+        pending_thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.parent_session_id(), Some(&pending_parent));
+        });
+    }
+
     // Regression test: per the ACP spec, an agent replays the entire conversation
     // history as `session/update` notifications *before* responding to the
     // `session/load` request. These notifications must be applied to the
@@ -4151,6 +4311,7 @@ mod tests {
         ];
 
         let session_id = acp::SessionId::new("session-replay");
+        let parent_session_id = acp::SessionId::new("parent-session");
         let work_dirs = util::path_list::PathList::new(&[std::path::Path::new("/a")]);
 
         let thread = cx
@@ -4159,6 +4320,7 @@ mod tests {
                     session_id.clone(),
                     project.clone(),
                     work_dirs,
+                    Some(parent_session_id.clone()),
                     None,
                     cx,
                 )
@@ -4166,6 +4328,9 @@ mod tests {
             .await
             .expect("load_session failed");
         cx.run_until_parked();
+        thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.parent_session_id().cloned(), Some(parent_session_id));
+        });
 
         let entries = thread.read_with(cx, |thread, _| {
             thread
@@ -4222,6 +4387,7 @@ mod tests {
                 session_id.clone(),
                 project.clone(),
                 work_dirs,
+                None,
                 None,
                 cx,
             )
@@ -4320,6 +4486,7 @@ mod tests {
                 project.clone(),
                 work_dirs.clone(),
                 None,
+                None,
                 cx,
             )
         });
@@ -4328,6 +4495,7 @@ mod tests {
                 session_id.clone(),
                 project.clone(),
                 work_dirs.clone(),
+                None,
                 None,
                 cx,
             )
@@ -4914,6 +5082,21 @@ fn handle_session_notification(
             "Failed to handle session update for {:?}: {err:?}",
             notification.session_id
         );
+    }
+
+    let subagent_session_info = match &notification.update {
+        acp::SessionUpdate::ToolCall(tool_call) => subagent_session_info_from_meta(&tool_call.meta),
+        acp::SessionUpdate::ToolCallUpdate(tool_call_update) => {
+            subagent_session_info_from_meta(&tool_call_update.meta)
+        }
+        _ => None,
+    };
+    if let Some(info) = subagent_session_info {
+        thread
+            .update(cx, |thread, cx| {
+                thread.subagent_spawned(info.session_id, cx);
+            })
+            .log_err();
     }
 
     // Post-handle: stream terminal output/exit if present on ToolCallUpdate meta.

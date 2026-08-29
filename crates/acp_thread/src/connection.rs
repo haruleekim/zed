@@ -115,6 +115,7 @@ pub trait AgentConnection {
         _session_id: acp::SessionId,
         _project: Entity<Project>,
         _work_dirs: PathList,
+        _parent_session_id: Option<acp::SessionId>,
         _title: Option<SharedString>,
         _cx: &mut App,
     ) -> Task<Result<Entity<AcpThread>>> {
@@ -827,13 +828,14 @@ mod test_support {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut gpui::App,
         ) -> Entity<AcpThread> {
             let action_log = cx.new(|_| ActionLog::new(project.clone()));
             let thread = cx.new(|cx| {
                 AcpThread::new(
-                    None,
+                    parent_session_id,
                     title,
                     Some(work_dirs),
                     self.clone(),
@@ -921,7 +923,7 @@ mod test_support {
             cx: &mut gpui::App,
         ) -> Task<gpui::Result<Entity<AcpThread>>> {
             let session_id = acp::SessionId::new(StubSessionCounter::next(cx).to_string());
-            let thread = self.create_session(session_id, project, work_dirs, None, cx);
+            let thread = self.create_session(session_id, project, work_dirs, None, None, cx);
             Task::ready(Ok(thread))
         }
 
@@ -938,6 +940,7 @@ mod test_support {
             session_id: acp::SessionId,
             project: Entity<Project>,
             work_dirs: PathList,
+            parent_session_id: Option<acp::SessionId>,
             title: Option<SharedString>,
             cx: &mut App,
         ) -> Task<Result<Entity<AcpThread>>> {
@@ -945,7 +948,8 @@ mod test_support {
                 return Task::ready(Err(anyhow::Error::msg("Loading sessions is not supported")));
             }
 
-            let thread = self.create_session(session_id, project, work_dirs, title, cx);
+            let thread =
+                self.create_session(session_id, project, work_dirs, parent_session_id, title, cx);
             Task::ready(Ok(thread))
         }
 
