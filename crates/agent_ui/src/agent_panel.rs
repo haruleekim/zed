@@ -10,7 +10,7 @@ use std::{
     time::Duration,
 };
 
-use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus, line_range_suffix};
+use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, line_range_suffix};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol::schema::v1 as acp;
 use agent_servers::AgentServer;
@@ -4234,11 +4234,12 @@ impl AgentPanel {
             .retained_threads
             .iter()
             .filter(|(_id, view)| {
-                let Some(thread_view) = view.read(cx).root_thread_view() else {
+                let view = view.read(cx);
+                let Some(thread_view) = view.root_thread_view() else {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && thread.status() == ThreadStatus::Idle
+                thread.connection().supports_load_session() && !view.has_generating_thread(cx)
             })
             .collect::<Vec<_>>();
 
@@ -6979,11 +6980,20 @@ mod tests {
     struct SessionTrackingConnection {
         next_session_number: Arc<Mutex<usize>>,
         sessions: Arc<Mutex<HashSet<acp::SessionId>>>,
+        closed_session_ids: Arc<Mutex<Vec<acp::SessionId>>>,
     }
 
     impl SessionTrackingConnection {
         fn new() -> Self {
             Self::default()
+        }
+
+        fn close_session_count(&self, session_id: &acp::SessionId) -> usize {
+            self.closed_session_ids
+                .lock()
+                .iter()
+                .filter(|closed_id| *closed_id == session_id)
+                .count()
         }
 
         fn create_session(
@@ -7092,6 +7102,7 @@ mod tests {
             session_id: &acp::SessionId,
             _cx: &mut App,
         ) -> Task<Result<()>> {
+            self.closed_session_ids.lock().push(session_id.clone());
             self.sessions.lock().remove(session_id);
             Task::ready(Ok(()))
         }
@@ -11198,6 +11209,94 @@ mod tests {
                 "the active thread should not also be stored as a retained thread"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_cleanup_retained_background_subagent_waits_for_child_completion(
+        cx: &mut TestAppContext,
+    ) {
+        let (panel, mut cx) = setup_panel(cx).await;
+        let connection = SessionTrackingConnection::new();
+        open_thread_with_custom_connection(&panel, connection.clone(), &mut cx);
+
+        let root_session_id = active_session_id(&panel, &cx);
+        let root_thread_id = active_thread_id(&panel, &cx);
+        let child_session_id = acp::SessionId::new("retained-background-subagent");
+        let (conversation_view, root_thread) = panel.read_with(&cx, |panel, cx| {
+            let conversation_view = panel
+                .active_conversation_view()
+                .expect("root conversation should be active");
+            let root_thread = conversation_view
+                .read(cx)
+                .root_thread(cx)
+                .expect("root thread should be loaded");
+            (conversation_view.downgrade(), root_thread)
+        });
+
+        root_thread.update(&mut cx, |thread, cx| {
+            thread.subagent_spawned(child_session_id.clone(), cx);
+        });
+        cx.run_until_parked();
+
+        let child_thread = conversation_view
+            .upgrade()
+            .expect("conversation should remain loaded")
+            .read_with(&cx, |view, cx| {
+                view.thread_view(&child_session_id)
+                    .expect("child thread should be loaded")
+                    .read(cx)
+                    .thread
+                    .clone()
+            });
+        child_thread.update(&mut cx, |thread, cx| {
+            thread.set_external_subagent_running(true, cx);
+        });
+
+        panel.read_with(&cx, |panel, cx| {
+            assert_eq!(
+                root_thread.read(cx).status(),
+                ThreadStatus::Idle,
+                "root should be idle while the child generates"
+            );
+            assert_eq!(
+                child_thread.read(cx).status(),
+                ThreadStatus::Generating,
+                "child should remain generating"
+            );
+        });
+
+        cx.update(|_, cx| {
+            MaxIdleRetainedThreads::set_global(cx, MaxIdleRetainedThreads(0));
+        });
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                panel.retained_threads.contains_key(&root_thread_id),
+                "conversation with a generating child should not be evicted"
+            );
+        });
+        assert_eq!(connection.close_session_count(&root_session_id), 0);
+        assert_eq!(connection.close_session_count(&child_session_id), 0);
+
+        child_thread.update(&mut cx, |thread, cx| {
+            thread.set_external_subagent_running(false, cx);
+        });
+        panel.update(&mut cx, |panel, cx| panel.cleanup_retained_threads(cx));
+        cx.run_until_parked();
+
+        panel.read_with(&cx, |panel, _cx| {
+            assert!(
+                !panel.retained_threads.contains_key(&root_thread_id),
+                "conversation should become evictable after the child completes"
+            );
+        });
+        assert!(
+            conversation_view.upgrade().is_none(),
+            "evicted conversation view should be released"
+        );
+        assert_eq!(connection.close_session_count(&root_session_id), 1);
+        assert_eq!(connection.close_session_count(&child_session_id), 1);
     }
 
     #[gpui::test]

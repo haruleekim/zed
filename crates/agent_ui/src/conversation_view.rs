@@ -755,6 +755,14 @@ impl ConversationView {
             .map(|view| view.read(cx).thread.clone())
     }
 
+    pub fn has_generating_thread(&self, cx: &App) -> bool {
+        self.as_connected().is_some_and(|connected| {
+            connected.threads.values().any(|thread_view| {
+                thread_view.read(cx).thread.read(cx).status() == ThreadStatus::Generating
+            })
+        })
+    }
+
     pub fn root_thread_view(&self) -> Option<Entity<ThreadView>> {
         self.root_session_id
             .as_ref()
