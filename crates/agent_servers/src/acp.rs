@@ -769,6 +769,7 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         ("terminal_output".into(), true.into()),
         ("terminal-auth".into(), true.into()),
         ("subagent_session_info".into(), true.into()),
+        ("subagent_session_auto_load".into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -3085,17 +3086,16 @@ mod tests {
     }
 
     #[test]
-    fn client_capabilities_include_subagent_session_info_meta() {
+    fn client_capabilities_include_subagent_session_meta() {
         for agent_id in [AgentId::new("codex-acp"), AgentId::new(CURSOR_ID)] {
             let capabilities = client_capabilities_for_agent(&agent_id);
             let meta = capabilities
                 .meta
                 .expect("expected client capabilities meta");
 
-            assert_eq!(
-                meta.get("subagent_session_info"),
-                Some(&serde_json::json!(true))
-            );
+            for capability in ["subagent_session_info", "subagent_session_auto_load"] {
+                assert_eq!(meta.get(capability), Some(&serde_json::json!(true)));
+            }
         }
     }
 

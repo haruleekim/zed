@@ -3941,7 +3941,7 @@ impl AcpThread {
 
         let previous_status = self.status();
         let turn = self.running_turn.take();
-        if turn.is_none() && self.parent_session_id.is_none() {
+        if turn.is_none() && !self.external_subagent_running {
             return Task::ready(());
         }
 
@@ -7531,7 +7531,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_child_cancel_without_local_turn_cancels_entries_and_connection(
+    async fn test_external_subagent_cancel_without_local_turn_cancels_entries_and_connection(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
@@ -7553,6 +7553,7 @@ mod tests {
         thread
             .update(cx, |thread, cx| {
                 thread.promote_parent_session_id(Some(acp::SessionId::new("parent")));
+                thread.set_external_subagent_running(true, cx);
                 thread.handle_session_update(
                     acp::SessionUpdate::ToolCall(
                         acp::ToolCall::new(tool_call_id.clone(), "Pending child tool")
@@ -7573,6 +7574,47 @@ mod tests {
             connection.cancelled_sessions.borrow().as_slice(),
             [child_session_id]
         );
+    }
+
+    #[gpui::test]
+    async fn test_idle_parented_subagent_cancel_without_external_run_is_noop(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let tool_call_id = acp::ToolCallId::new("idle-parented-child-tool");
+        thread
+            .update(cx, |thread, cx| {
+                thread.promote_parent_session_id(Some(acp::SessionId::new("parent")));
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Idle parented child tool")
+                            .status(acp::ToolCallStatus::Pending),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread.tool_call(&tool_call_id).unwrap();
+            assert!(matches!(tool_call.status, ToolCallStatus::Pending));
+        });
+        assert!(connection.cancelled_sessions.borrow().is_empty());
     }
 
     fn only_thread_elicitation(thread: &AcpThread) -> (ElicitationEntryId, &Elicitation) {
