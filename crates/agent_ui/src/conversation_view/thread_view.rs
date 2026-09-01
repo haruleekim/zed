@@ -9,8 +9,10 @@ use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
 
 use acp_thread::{
-    Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry, SandboxAuthorizationDetails,
-    SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason, decode_path_escapes,
+    BackgroundJobInfo, BackgroundJobStatus, BackgroundProcessInfo, BackgroundProcessState,
+    BackgroundWorkTarget, Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry,
+    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
+    decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -592,6 +594,7 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
+    pending_background_work_stops: HashSet<acp::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp::ToolCallId>,
     /// Sandbox escalation prompts whose "surprising Unicode" warning the user
@@ -685,6 +688,131 @@ enum ToolCallLayout {
     Standalone,
     Embedded,
     Floating,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundCardIcon {
+    Running,
+    Ready,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BackgroundCardStatus {
+    label: &'static str,
+    icon: BackgroundCardIcon,
+    stoppable: bool,
+    failed: bool,
+    cancelled: bool,
+}
+
+fn background_job_card_status(status: BackgroundJobStatus) -> BackgroundCardStatus {
+    match status {
+        BackgroundJobStatus::Running => BackgroundCardStatus {
+            label: "Running",
+            icon: BackgroundCardIcon::Running,
+            stoppable: true,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundJobStatus::Completed => BackgroundCardStatus {
+            label: "Completed",
+            icon: BackgroundCardIcon::Completed,
+            stoppable: false,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundJobStatus::Failed => BackgroundCardStatus {
+            label: "Failed",
+            icon: BackgroundCardIcon::Failed,
+            stoppable: false,
+            failed: true,
+            cancelled: false,
+        },
+        BackgroundJobStatus::Cancelled => BackgroundCardStatus {
+            label: "Cancelled",
+            icon: BackgroundCardIcon::Cancelled,
+            stoppable: false,
+            failed: false,
+            cancelled: true,
+        },
+    }
+}
+
+fn background_process_card_status(state: BackgroundProcessState) -> BackgroundCardStatus {
+    match state {
+        BackgroundProcessState::Starting => BackgroundCardStatus {
+            label: "Starting",
+            icon: BackgroundCardIcon::Running,
+            stoppable: true,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundProcessState::Running => BackgroundCardStatus {
+            label: "Running",
+            icon: BackgroundCardIcon::Running,
+            stoppable: true,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundProcessState::Ready => BackgroundCardStatus {
+            label: "Ready",
+            icon: BackgroundCardIcon::Ready,
+            stoppable: true,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundProcessState::Restarting => BackgroundCardStatus {
+            label: "Restarting",
+            icon: BackgroundCardIcon::Running,
+            stoppable: true,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundProcessState::Stopping => BackgroundCardStatus {
+            label: "Stopping",
+            icon: BackgroundCardIcon::Running,
+            stoppable: false,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundProcessState::Exited => BackgroundCardStatus {
+            label: "Exited",
+            icon: BackgroundCardIcon::Completed,
+            stoppable: false,
+            failed: false,
+            cancelled: false,
+        },
+        BackgroundProcessState::Failed => BackgroundCardStatus {
+            label: "Failed",
+            icon: BackgroundCardIcon::Failed,
+            stoppable: false,
+            failed: true,
+            cancelled: false,
+        },
+        BackgroundProcessState::Cancelled => BackgroundCardStatus {
+            label: "Cancelled",
+            icon: BackgroundCardIcon::Cancelled,
+            stoppable: false,
+            failed: false,
+            cancelled: true,
+        },
+    }
+}
+
+fn background_job_elapsed_ms(info: &BackgroundJobInfo, now_ms: u64) -> Option<u64> {
+    let started_at = info.started_at?;
+    match info.status {
+        BackgroundJobStatus::Running => Some(now_ms.saturating_sub(started_at)),
+        _ => info.duration_ms,
+    }
+}
+
+fn background_process_elapsed_ms(info: &BackgroundProcessInfo, now_ms: u64) -> Option<u64> {
+    let started_at = info.started_at?;
+    Some(info.exited_at.unwrap_or(now_ms).saturating_sub(started_at))
 }
 
 impl ToolCallLayout {
@@ -1010,6 +1138,7 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            pending_background_work_stops: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             acknowledged_confusable_warnings: HashSet::default(),
@@ -8087,6 +8216,238 @@ impl ThreadView {
             })
     }
 
+    fn render_background_tool_call(
+        &self,
+        entry_ix: usize,
+        tool_call: &ToolCall,
+        layout: ToolCallLayout,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
+        let mut badges = Vec::<SharedString>::new();
+        let (status, target, elapsed_ms, fallback_title) =
+            if let Some(info) = tool_call.background_job_info.as_ref() {
+                (
+                    background_job_card_status(info.status),
+                    BackgroundWorkTarget::Job {
+                        job_id: info.job_id.clone(),
+                    },
+                    background_job_elapsed_ms(info, now_ms),
+                    info.label.clone(),
+                )
+            } else if let Some(info) = tool_call.background_process_info.as_ref() {
+                if info.restart_count > 0 {
+                    badges.push(format!("Restarted {}×", info.restart_count).into());
+                }
+                if info.persist {
+                    badges.push("Persistent".into());
+                }
+                if info.detached {
+                    badges.push("Detached".into());
+                }
+                (
+                    background_process_card_status(info.state),
+                    BackgroundWorkTarget::Process {
+                        name: info.name.clone(),
+                        process_id: info.process_id.clone(),
+                    },
+                    background_process_elapsed_ms(info, now_ms),
+                    info.name.clone(),
+                )
+            } else {
+                return Empty.into_any_element();
+            };
+        if let Some(elapsed_ms) = elapsed_ms {
+            badges.push(duration_alt_display(Duration::from_millis(elapsed_ms)).into());
+        }
+
+        let title = tool_call.label.read(cx).source().to_string();
+        let title = if title.is_empty() {
+            SharedString::from(fallback_title)
+        } else {
+            SharedString::from(title)
+        };
+        let has_output = tool_call.raw_output_markdown.is_some();
+        let is_expanded = has_output
+            && self
+                .entry_view_state
+                .read(cx)
+                .is_tool_call_expanded(&tool_call.id);
+        let header_id = SharedString::from(format!("background-tool-header-{entry_ix}"));
+        let stop_pending = self.pending_background_work_stops.contains(&tool_call.id);
+        let stop_control = status.stoppable.then(|| {
+            self.thread
+                .read(cx)
+                .connection()
+                .background_work_control(&target, cx)
+        });
+
+        let status_icon = match status.icon {
+            BackgroundCardIcon::Running => SpinnerLabel::new()
+                .size(LabelSize::Small)
+                .into_any_element(),
+            BackgroundCardIcon::Ready => Icon::new(IconName::Circle)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+            BackgroundCardIcon::Completed => Icon::new(IconName::Check)
+                .size(IconSize::Small)
+                .color(Color::Success)
+                .into_any_element(),
+            BackgroundCardIcon::Failed => Icon::new(IconName::Close)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+            BackgroundCardIcon::Cancelled => Icon::new(IconName::XCircle)
+                .size(IconSize::Small)
+                .color(Color::Error)
+                .into_any_element(),
+        };
+        let status_color = if status.failed || status.cancelled {
+            Color::Error
+        } else {
+            Color::Muted
+        };
+
+        let header = h_flex()
+            .group(&header_id)
+            .h_8()
+            .p_1()
+            .w_full()
+            .gap_1()
+            .justify_between()
+            .bg(self.tool_card_header_bg(cx))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(h_flex().w_4().justify_center().child(status_icon))
+                    .child(
+                        Label::new(title.clone())
+                            .size(LabelSize::Custom(self.tool_name_font_size()))
+                            .truncate(),
+                    )
+                    .child(
+                        Label::new(status.label)
+                            .size(LabelSize::XSmall)
+                            .color(status_color),
+                    )
+                    .children(badges.into_iter().map(|badge| {
+                        Label::new(badge)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted)
+                    })),
+            )
+            .child(
+                h_flex()
+                    .gap_1()
+                    .when_some(stop_control.flatten(), |this, control| {
+                        let session_id = self.thread.read(cx).session_id().clone();
+                        let target = target.clone();
+                        let tool_call_id = tool_call.id.clone();
+                        let stop_button_id = format!("stop-background-work-{entry_ix}");
+                        let stop_selector = stop_button_id.clone();
+                        this.child(
+                            IconButton::new(stop_button_id, IconName::Stop)
+                                .debug_selector(move || stop_selector.clone())
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Error)
+                                .disabled(stop_pending)
+                                .aria_label("Stop Background Work")
+                                .tooltip(Tooltip::text(if stop_pending {
+                                    "Stopping Background Work"
+                                } else {
+                                    "Stop Background Work"
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this
+                                        .pending_background_work_stops
+                                        .insert(tool_call_id.clone())
+                                    {
+                                        return;
+                                    }
+                                    let task = control.stop(&session_id, target.clone(), cx);
+                                    cx.notify();
+                                    let pending_tool_call_id = tool_call_id.clone();
+                                    cx.spawn(async move |this, cx| {
+                                        let result = task.await;
+                                        this.update(cx, |this, cx| {
+                                            this.pending_background_work_stops
+                                                .remove(&pending_tool_call_id);
+                                            if let Err(error) = result {
+                                                this.handle_thread_error(error, cx);
+                                            } else {
+                                                cx.notify();
+                                            }
+                                        })
+                                        .ok();
+                                    })
+                                    .detach();
+                                })),
+                        )
+                    })
+                    .when(has_output, |this| {
+                        let tool_call_id = tool_call.id.clone();
+                        this.child(
+                            Disclosure::new(("expand-background-output", entry_ix), is_expanded)
+                                .opened_icon(IconName::ChevronUp)
+                                .closed_icon(IconName::ChevronDown)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.entry_view_state.update(cx, |state, _cx| {
+                                        state.toggle_tool_call_expansion(&tool_call_id);
+                                    });
+                                    this.refresh_thread_search(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+
+        v_flex()
+            .w_full()
+            .rounded_md()
+            .border_1()
+            .when(status.failed || status.cancelled, |this| {
+                this.border_dashed()
+            })
+            .border_color(self.tool_card_border_color(cx))
+            .bg(cx.theme().colors().editor_background)
+            .overflow_hidden()
+            .child(header)
+            .when_some(
+                is_expanded
+                    .then(|| tool_call.raw_output_markdown.clone())
+                    .flatten(),
+                |this, output| {
+                    this.child(
+                        div()
+                            .id(("background-tool-output", entry_ix))
+                            .w_full()
+                            .p_2()
+                            .border_t_1()
+                            .border_color(self.tool_card_border_color(cx))
+                            .map(|this| {
+                                if layout == ToolCallLayout::Floating {
+                                    this.max_h_40().overflow_y_scroll()
+                                } else {
+                                    this
+                                }
+                            })
+                            .child(self.render_markdown(
+                                output,
+                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
+                                cx,
+                            )),
+                    )
+                },
+            )
+            .when(layout == ToolCallLayout::Standalone, |this| {
+                this.my_1p5().ml_5().mr_5()
+            })
+            .into_any_element()
+    }
+
     fn render_any_tool_call(
         &self,
         active_session_id: &acp::SessionId,
@@ -8112,7 +8473,13 @@ impl ThreadView {
         )));
 
         div().w_full().id(container_id).map(|this| {
-            if tool_call.is_subagent() {
+            if tool_call.background_job_info.is_some()
+                || tool_call.background_process_info.is_some()
+            {
+                this.child(
+                    self.render_background_tool_call(entry_ix, tool_call, layout, window, cx),
+                )
+            } else if tool_call.is_subagent() {
                 this.child(
                     self.render_subagent_tool_call(
                         active_session_id,
@@ -12921,6 +13288,75 @@ mod tests {
             let snapshot = editor.snapshot(window, cx);
             assert_eq!(editor.selections.newest::<Point>(&snapshot).head().row, 1);
         });
+    }
+    #[test]
+    fn background_card_status_controls_icon_and_stop_visibility() {
+        assert_eq!(
+            background_job_card_status(BackgroundJobStatus::Running),
+            BackgroundCardStatus {
+                label: "Running",
+                icon: BackgroundCardIcon::Running,
+                stoppable: true,
+                failed: false,
+                cancelled: false,
+            }
+        );
+        assert!(!background_job_card_status(BackgroundJobStatus::Completed).stoppable);
+        assert!(background_job_card_status(BackgroundJobStatus::Failed).failed);
+        assert!(background_job_card_status(BackgroundJobStatus::Cancelled).cancelled);
+
+        for state in [
+            BackgroundProcessState::Starting,
+            BackgroundProcessState::Running,
+            BackgroundProcessState::Ready,
+            BackgroundProcessState::Restarting,
+        ] {
+            assert!(background_process_card_status(state).stoppable);
+        }
+        assert!(!background_process_card_status(BackgroundProcessState::Stopping).stoppable);
+        assert_eq!(
+            background_process_card_status(BackgroundProcessState::Exited).icon,
+            BackgroundCardIcon::Completed
+        );
+        assert!(background_process_card_status(BackgroundProcessState::Failed).failed);
+        assert!(background_process_card_status(BackgroundProcessState::Cancelled).cancelled);
+    }
+
+    #[test]
+    fn background_card_elapsed_time_requires_a_start_timestamp() {
+        let mut job = BackgroundJobInfo {
+            job_id: "bg_1".into(),
+            job_type: acp_thread::BackgroundJobType::Bash,
+            status: BackgroundJobStatus::Running,
+            label: "loop".into(),
+            started_at: Some(1_000),
+            duration_ms: None,
+        };
+        assert_eq!(background_job_elapsed_ms(&job, 1_250), Some(250));
+        job.status = BackgroundJobStatus::Completed;
+        job.duration_ms = Some(300);
+        assert_eq!(background_job_elapsed_ms(&job, 2_000), Some(300));
+        job.started_at = None;
+        assert_eq!(background_job_elapsed_ms(&job, 2_000), None);
+
+        let mut process = BackgroundProcessInfo {
+            process_id: "daemon-1".into(),
+            name: "web".into(),
+            state: BackgroundProcessState::Ready,
+            started_at: Some(1_000),
+            ready_at: Some(1_100),
+            exited_at: None,
+            exit_code: None,
+            exit_reason: None,
+            restart_count: 0,
+            persist: false,
+            detached: false,
+        };
+        assert_eq!(background_process_elapsed_ms(&process, 1_250), Some(250));
+        process.exited_at = Some(1_400);
+        assert_eq!(background_process_elapsed_ms(&process, 2_000), Some(400));
+        process.started_at = None;
+        assert_eq!(background_process_elapsed_ms(&process, 2_000), None);
     }
 }
 

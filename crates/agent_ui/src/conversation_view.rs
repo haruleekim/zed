@@ -755,10 +755,12 @@ impl ConversationView {
             .map(|view| view.read(cx).thread.clone())
     }
 
-    pub fn has_generating_thread(&self, cx: &App) -> bool {
+    pub fn has_retained_activity(&self, cx: &App) -> bool {
         self.as_connected().is_some_and(|connected| {
             connected.threads.values().any(|thread_view| {
-                thread_view.read(cx).thread.read(cx).status() == ThreadStatus::Generating
+                let thread = thread_view.read(cx).thread.read(cx);
+                thread.status() == ThreadStatus::Generating
+                    || thread.has_running_session_bound_background_job()
             })
         })
     }

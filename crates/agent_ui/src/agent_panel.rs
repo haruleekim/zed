@@ -4239,7 +4239,7 @@ impl AgentPanel {
                     return true;
                 };
                 let thread = thread_view.read(cx).thread.read(cx);
-                thread.connection().supports_load_session() && !view.has_generating_thread(cx)
+                thread.connection().supports_load_session() && !view.has_retained_activity(cx)
             })
             .collect::<Vec<_>>();
 
@@ -6887,7 +6887,11 @@ mod tests {
         active_session_id, active_thread_id, open_thread_with_connection,
         open_thread_with_custom_connection, register_test_sidebar, send_message,
     };
-    use acp_thread::{AgentConnection, StubAgentConnection, ThreadStatus};
+    use acp_thread::{
+        AgentConnection, BackgroundJobInfo, BackgroundJobStatus, BackgroundJobType,
+        BackgroundProcessInfo, BackgroundProcessState, BackgroundWorkTarget, StubAgentConnection,
+        ThreadStatus, meta_with_background_job_info, meta_with_background_process_info,
+    };
     use action_log::ActionLog;
     use anyhow::{Result, anyhow};
     use feature_flags::FeatureFlagAppExt;
@@ -7247,6 +7251,148 @@ mod tests {
                 "focusing the thread title editor should not close Zen Mode"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_background_stop_buttons_dispatch_scoped_targets(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let connection = StubAgentConnection::new().with_background_work_control();
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel
+        });
+        open_thread_with_connection(&panel, connection.clone(), cx);
+        send_message(&panel, cx);
+
+        let session_id = active_session_id(&panel, cx);
+        let job_tool_call_id = acp::ToolCallId::new("background-job");
+        cx.update(|_window, cx| {
+            let mut job_call = acp::ToolCall::new(job_tool_call_id.clone(), "bash loop")
+                .status(acp::ToolCallStatus::Completed)
+                .raw_output(serde_json::json!("TAIL_1\nTAIL_2"));
+            job_call.meta = Some(meta_with_background_job_info(BackgroundJobInfo {
+                job_id: "bg_1".into(),
+                job_type: BackgroundJobType::Bash,
+                status: BackgroundJobStatus::Running,
+                label: "bash loop".into(),
+                started_at: Some(1_000),
+                duration_ms: None,
+            }));
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(job_call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        panel.update_in(cx, |panel, window, cx| {
+            panel.toggle_zoom(&ToggleZoom, window, cx);
+        });
+        cx.run_until_parked();
+
+        let job_output_toggle = cx
+            .debug_bounds("ICON-ChevronDown")
+            .expect("background output should render a disclosure");
+        cx.simulate_click(job_output_toggle.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("ICON-ChevronUp").is_some(),
+            "clicking background output disclosure should expand the tail"
+        );
+
+        let job_stop = cx
+            .debug_bounds("stop-background-work-1")
+            .expect("running background job should render Stop");
+        cx.simulate_click(job_stop.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCallUpdate(
+                    acp::ToolCallUpdate::new(job_tool_call_id, acp::ToolCallUpdateFields::new())
+                        .meta(meta_with_background_job_info(BackgroundJobInfo {
+                            job_id: "bg_1".into(),
+                            job_type: BackgroundJobType::Bash,
+                            status: BackgroundJobStatus::Cancelled,
+                            label: "bash loop".into(),
+                            started_at: Some(1_000),
+                            duration_ms: Some(1),
+                        })),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        cx.update(|_window, cx| {
+            let mut process_call = acp::ToolCall::new("background-process", "web")
+                .status(acp::ToolCallStatus::Completed);
+            process_call.meta = Some(meta_with_background_process_info(BackgroundProcessInfo {
+                process_id: "daemon-1".into(),
+                name: "web".into(),
+                state: BackgroundProcessState::Ready,
+                started_at: Some(1_000),
+                ready_at: Some(1_100),
+                exited_at: None,
+                exit_code: None,
+                exit_reason: None,
+                restart_count: 0,
+                persist: false,
+                detached: false,
+            }));
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(process_call),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        let process_stop = cx
+            .debug_bounds("stop-background-work-2")
+            .expect("ready background process should render Stop");
+        cx.simulate_click(process_stop.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(
+            connection.background_work_stops(),
+            vec![
+                (
+                    session_id.clone(),
+                    BackgroundWorkTarget::Job {
+                        job_id: "bg_1".into(),
+                    },
+                ),
+                (
+                    session_id,
+                    BackgroundWorkTarget::Process {
+                        name: "web".into(),
+                        process_id: "daemon-1".into(),
+                    },
+                ),
+            ]
+        );
     }
 
     #[gpui::test]

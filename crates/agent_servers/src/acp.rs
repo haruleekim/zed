@@ -1,13 +1,16 @@
 use acp_thread::{
-    AgentConnection, AgentSessionInfo, AgentSessionList, AgentSessionListRequest,
-    AgentSessionListResponse, ElicitationStore, subagent_session_info_from_meta,
+    AgentBackgroundWorkControl, AgentConnection, AgentSessionInfo, AgentSessionList,
+    AgentSessionListRequest, AgentSessionListResponse, BackgroundWorkStopOutcome,
+    BackgroundWorkTarget, ElicitationStore, subagent_session_info_from_meta,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::{
     ProtocolVersion,
     v1::{self as acp, ErrorCode},
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
+use agent_client_protocol::{
+    Agent, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Lines, Responder,
+};
 use anyhow::anyhow;
 use async_channel;
 use collections::{HashMap, HashSet};
@@ -21,7 +24,7 @@ use project::agent_server_store::{
 };
 use project::{AgentId, Project};
 use remote::remote_client::Interactive;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use settings::{AgentConfigOptionValue, SettingsStore};
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
@@ -46,6 +49,117 @@ use crate::{CURSOR_ID, GEMINI_ID};
 pub const GEMINI_TERMINAL_AUTH_METHOD_ID: &str = "spawn-gemini-cli";
 const PARAMETERIZED_MODEL_PICKER_META_KEY: &str = "parameterizedModelPicker";
 const MAX_DEBUG_BACKLOG_MESSAGES: usize = 2000;
+const BACKGROUND_JOB_CANCEL_CAPABILITY: &str = "background_job_cancel";
+const BACKGROUND_PROCESS_STOP_CAPABILITY: &str = "background_process_stop";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct BackgroundWorkControlCapabilities {
+    job_cancel: bool,
+    process_stop: bool,
+}
+
+impl BackgroundWorkControlCapabilities {
+    fn from_agent_capabilities(capabilities: &acp::AgentCapabilities) -> Self {
+        let enabled = |key| {
+            capabilities
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get(key))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        };
+        Self {
+            job_cancel: enabled(BACKGROUND_JOB_CANCEL_CAPABILITY),
+            process_stop: enabled(BACKGROUND_PROCESS_STOP_CAPABILITY),
+        }
+    }
+
+    fn supports(self, target: &BackgroundWorkTarget) -> bool {
+        match target {
+            BackgroundWorkTarget::Job { .. } => self.job_cancel,
+            BackgroundWorkTarget::Process { .. } => self.process_stop,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonRpcRequest)]
+#[serde(rename_all = "camelCase")]
+#[request(method = "_omp/jobs/cancel", response = BackgroundWorkStopResponse)]
+struct BackgroundJobCancelRequest {
+    session_id: acp::SessionId,
+    job_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonRpcRequest)]
+#[serde(rename_all = "camelCase")]
+#[request(
+    method = "_omp/processes/stop",
+    response = BackgroundWorkStopResponse
+)]
+struct BackgroundProcessStopRequest {
+    session_id: acp::SessionId,
+    name: String,
+    process_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonRpcResponse)]
+struct BackgroundWorkStopResponse {
+    outcome: BackgroundWorkStopResponseOutcome,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BackgroundWorkStopResponseOutcome {
+    Cancelled,
+    AlreadyTerminal,
+}
+
+impl From<BackgroundWorkStopResponseOutcome> for BackgroundWorkStopOutcome {
+    fn from(outcome: BackgroundWorkStopResponseOutcome) -> Self {
+        match outcome {
+            BackgroundWorkStopResponseOutcome::Cancelled => Self::Cancelled,
+            BackgroundWorkStopResponseOutcome::AlreadyTerminal => Self::AlreadyTerminal,
+        }
+    }
+}
+
+struct AcpBackgroundWorkControl {
+    connection: ConnectionTo<Agent>,
+}
+
+impl AgentBackgroundWorkControl for AcpBackgroundWorkControl {
+    fn stop(
+        &self,
+        session_id: &acp::SessionId,
+        target: BackgroundWorkTarget,
+        cx: &mut App,
+    ) -> Task<Result<BackgroundWorkStopOutcome>> {
+        let connection = self.connection.clone();
+        let session_id = session_id.clone();
+        cx.foreground_executor().spawn(async move {
+            let response = match target {
+                BackgroundWorkTarget::Job { job_id } => {
+                    connection
+                        .send_request(BackgroundJobCancelRequest { session_id, job_id })
+                        .block_task()
+                        .await
+                }
+                BackgroundWorkTarget::Process { name, process_id } => {
+                    connection
+                        .send_request(BackgroundProcessStopRequest {
+                            session_id,
+                            name,
+                            process_id,
+                        })
+                        .block_task()
+                        .await
+                }
+            }
+            .map_err(map_acp_error)?;
+            Ok(response.outcome.into())
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AcpDebugMessageDirection {
@@ -770,6 +884,8 @@ fn client_capabilities_for_agent(agent_id: &AgentId) -> acp::ClientCapabilities 
         ("terminal-auth".into(), true.into()),
         ("subagent_session_info".into(), true.into()),
         ("subagent_session_auto_load".into(), true.into()),
+        ("background_job_info".into(), true.into()),
+        ("background_process_info".into(), true.into()),
     ]);
 
     if agent_id.as_ref() == CURSOR_ID {
@@ -2022,6 +2138,20 @@ impl AgentConnection for AcpConnection {
         })
     }
 
+    fn background_work_control(
+        &self,
+        target: &BackgroundWorkTarget,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentBackgroundWorkControl>> {
+        BackgroundWorkControlCapabilities::from_agent_capabilities(&self.agent_capabilities)
+            .supports(target)
+            .then(|| {
+                Rc::new(AcpBackgroundWorkControl {
+                    connection: self.connection.clone(),
+                }) as Rc<dyn AgentBackgroundWorkControl>
+            })
+    }
+
     fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
         if let Some(session) = self.sessions.borrow_mut().get_mut(session_id) {
             session.suppress_abort_err = true;
@@ -2381,6 +2511,14 @@ pub mod test_support {
             cx: &App,
         ) -> Option<Rc<dyn AgentSessionRetry>> {
             self.inner.retry(session_id, cx)
+        }
+
+        fn background_work_control(
+            &self,
+            target: &BackgroundWorkTarget,
+            cx: &App,
+        ) -> Option<Rc<dyn AgentBackgroundWorkControl>> {
+            self.inner.background_work_control(target, cx)
         }
 
         fn cancel(&self, session_id: &acp::SessionId, cx: &mut App) {
@@ -3097,6 +3235,92 @@ mod tests {
                 assert_eq!(meta.get(capability), Some(&serde_json::json!(true)));
             }
         }
+    }
+
+    #[test]
+    fn background_client_capabilities_are_advertised_for_every_external_agent() {
+        for agent_id in [AgentId::new("codex-acp"), AgentId::new(CURSOR_ID)] {
+            let capabilities = client_capabilities_for_agent(&agent_id);
+            let meta = capabilities
+                .meta
+                .expect("expected client capabilities meta");
+            for capability in ["background_job_info", "background_process_info"] {
+                assert_eq!(meta.get(capability), Some(&serde_json::json!(true)));
+            }
+        }
+    }
+
+    #[test]
+    fn background_agent_control_capabilities_require_exact_booleans() {
+        let mut capabilities = acp::AgentCapabilities::default();
+        capabilities.meta = Some(acp::Meta::from_iter([
+            (BACKGROUND_JOB_CANCEL_CAPABILITY.into(), true.into()),
+            (
+                BACKGROUND_PROCESS_STOP_CAPABILITY.into(),
+                serde_json::json!("true"),
+            ),
+        ]));
+        assert_eq!(
+            BackgroundWorkControlCapabilities::from_agent_capabilities(&capabilities),
+            BackgroundWorkControlCapabilities {
+                job_cancel: true,
+                process_stop: false,
+            }
+        );
+
+        capabilities.meta = Some(acp::Meta::from_iter([
+            (BACKGROUND_JOB_CANCEL_CAPABILITY.into(), false.into()),
+            (BACKGROUND_PROCESS_STOP_CAPABILITY.into(), true.into()),
+        ]));
+        assert_eq!(
+            BackgroundWorkControlCapabilities::from_agent_capabilities(&capabilities),
+            BackgroundWorkControlCapabilities {
+                job_cancel: false,
+                process_stop: true,
+            }
+        );
+    }
+
+    #[test]
+    fn background_control_requests_use_target_scoped_extension_methods() {
+        let job = BackgroundJobCancelRequest {
+            session_id: acp::SessionId::new("session-1"),
+            job_id: "bg_1".into(),
+        };
+        assert_eq!(
+            agent_client_protocol::JsonRpcMessage::method(&job),
+            "_omp/jobs/cancel"
+        );
+        assert_eq!(
+            serde_json::to_value(job).expect("job request should serialize"),
+            serde_json::json!({"sessionId": "session-1", "jobId": "bg_1"})
+        );
+
+        let process = BackgroundProcessStopRequest {
+            session_id: acp::SessionId::new("session-1"),
+            name: "web".into(),
+            process_id: "daemon-1".into(),
+        };
+        assert_eq!(
+            agent_client_protocol::JsonRpcMessage::method(&process),
+            "_omp/processes/stop"
+        );
+        assert_eq!(
+            serde_json::to_value(process).expect("process request should serialize"),
+            serde_json::json!({
+                "sessionId": "session-1",
+                "name": "web",
+                "processId": "daemon-1"
+            })
+        );
+
+        let response: BackgroundWorkStopResponse =
+            serde_json::from_value(serde_json::json!({"outcome": "already_terminal"}))
+                .expect("stop response should deserialize");
+        assert_eq!(
+            BackgroundWorkStopOutcome::from(response.outcome),
+            BackgroundWorkStopOutcome::AlreadyTerminal
+        );
     }
 
     #[test]

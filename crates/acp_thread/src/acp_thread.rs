@@ -290,6 +290,116 @@ pub fn subagent_session_info_from_meta(meta: &Option<acp::Meta>) -> Option<Subag
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+pub const BACKGROUND_JOB_INFO_META_KEY: &str = "background_job_info";
+pub const BACKGROUND_PROCESS_INFO_META_KEY: &str = "background_process_info";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundJobType {
+    Bash,
+    Eval,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundJobStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BackgroundJobInfo {
+    pub job_id: String,
+    pub job_type: BackgroundJobType,
+    pub status: BackgroundJobStatus,
+    pub label: String,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
+impl BackgroundJobInfo {
+    pub fn is_running(&self) -> bool {
+        self.status == BackgroundJobStatus::Running
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundProcessState {
+    Starting,
+    Running,
+    Ready,
+    Restarting,
+    Stopping,
+    Exited,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct BackgroundProcessInfo {
+    pub process_id: String,
+    pub name: String,
+    pub state: BackgroundProcessState,
+    #[serde(default)]
+    pub started_at: Option<u64>,
+    #[serde(default)]
+    pub ready_at: Option<u64>,
+    #[serde(default)]
+    pub exited_at: Option<u64>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub exit_reason: Option<String>,
+    pub restart_count: u32,
+    pub persist: bool,
+    pub detached: bool,
+}
+
+impl BackgroundProcessInfo {
+    pub fn is_stoppable(&self) -> bool {
+        matches!(
+            self.state,
+            BackgroundProcessState::Starting
+                | BackgroundProcessState::Running
+                | BackgroundProcessState::Ready
+                | BackgroundProcessState::Restarting
+        )
+    }
+}
+
+pub fn background_job_info_from_meta(meta: &Option<acp::Meta>) -> Option<BackgroundJobInfo> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(BACKGROUND_JOB_INFO_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+pub fn meta_with_background_job_info(info: BackgroundJobInfo) -> acp::Meta {
+    acp::Meta::from_iter([(
+        BACKGROUND_JOB_INFO_META_KEY.into(),
+        serde_json::to_value(info).unwrap_or_default(),
+    )])
+}
+
+pub fn background_process_info_from_meta(
+    meta: &Option<acp::Meta>,
+) -> Option<BackgroundProcessInfo> {
+    meta.as_ref()
+        .and_then(|meta| meta.get(BACKGROUND_PROCESS_INFO_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+}
+
+pub fn meta_with_background_process_info(info: BackgroundProcessInfo) -> acp::Meta {
+    acp::Meta::from_iter([(
+        BACKGROUND_PROCESS_INFO_META_KEY.into(),
+        serde_json::to_value(info).unwrap_or_default(),
+    )])
+}
+
 #[derive(Debug)]
 pub struct UserMessage {
     pub protocol_id: Option<acp::MessageId>,
@@ -868,8 +978,11 @@ pub struct ToolCall {
     pub raw_input: Option<serde_json::Value>,
     pub raw_input_markdown: Option<Entity<Markdown>>,
     pub raw_output: Option<serde_json::Value>,
+    pub raw_output_markdown: Option<Entity<Markdown>>,
     pub tool_name: Option<SharedString>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
+    pub background_job_info: Option<BackgroundJobInfo>,
+    pub background_process_info: Option<BackgroundProcessInfo>,
     pub sandbox_authorization_details: Option<SandboxAuthorizationDetails>,
     pub sandbox_fallback_authorization_details: Option<SandboxFallbackAuthorizationDetails>,
     /// Why this terminal command ran without the OS sandbox even though
@@ -913,10 +1026,16 @@ impl ToolCall {
             .raw_input
             .as_ref()
             .and_then(|input| markdown_for_raw_output(input, &language_registry, cx));
+        let raw_output_markdown = tool_call
+            .raw_output
+            .as_ref()
+            .and_then(|output| markdown_for_raw_output(output, &language_registry, cx));
 
         let tool_name = tool_name_from_meta(&tool_call.meta);
 
         let subagent_session_info = subagent_session_info_from_meta(&tool_call.meta);
+        let background_job_info = background_job_info_from_meta(&tool_call.meta);
+        let background_process_info = background_process_info_from_meta(&tool_call.meta);
         let sandbox_authorization_details =
             sandbox_authorization_details_from_meta(&tool_call.meta);
         let sandbox_fallback_authorization_details =
@@ -940,8 +1059,11 @@ impl ToolCall {
             raw_input: tool_call.raw_input,
             raw_input_markdown,
             raw_output: tool_call.raw_output,
+            raw_output_markdown,
             tool_name,
             subagent_session_info,
+            background_job_info,
+            background_process_info,
             sandbox_authorization_details,
             sandbox_fallback_authorization_details,
             sandbox_not_applied,
@@ -979,6 +1101,12 @@ impl ToolCall {
 
         if let Some(subagent_session_info) = subagent_session_info_from_meta(&meta) {
             self.subagent_session_info = Some(subagent_session_info);
+        }
+        if let Some(background_job_info) = background_job_info_from_meta(&meta) {
+            self.background_job_info = Some(background_job_info);
+        }
+        if let Some(background_process_info) = background_process_info_from_meta(&meta) {
+            self.background_process_info = Some(background_process_info);
         }
         if let Some(sandbox_authorization_details) = sandbox_authorization_details_from_meta(&meta)
         {
@@ -1053,6 +1181,7 @@ impl ToolCall {
         }
 
         if let Some(raw_output) = raw_output {
+            self.raw_output_markdown = markdown_for_raw_output(&raw_output, &language_registry, cx);
             if self.content.is_empty()
                 && let Some(markdown) = markdown_for_raw_output(&raw_output, &language_registry, cx)
             {
@@ -1064,6 +1193,12 @@ impl ToolCall {
             self.raw_output = Some(raw_output);
         }
         Ok(())
+    }
+
+    pub fn running_session_bound_background_job(&self) -> bool {
+        self.background_job_info
+            .as_ref()
+            .is_some_and(BackgroundJobInfo::is_running)
     }
 
     fn update_status(&mut self, status: ToolCallStatus) {
@@ -3170,8 +3305,11 @@ impl AcpThread {
                     raw_input: None,
                     raw_input_markdown: None,
                     raw_output: None,
+                    raw_output_markdown: None,
                     tool_name: None,
                     subagent_session_info: None,
+                    background_job_info: None,
+                    background_process_info: None,
                     sandbox_authorization_details: None,
                     sandbox_fallback_authorization_details: None,
                     sandbox_not_applied: None,
@@ -3334,6 +3472,22 @@ impl AcpThread {
                     None
                 }
             })
+    }
+
+    pub fn running_session_bound_background_job(&self, id: &acp::ToolCallId) -> Option<&ToolCall> {
+        self.tool_call(id)
+            .map(|(_, tool_call)| tool_call)
+            .filter(|tool_call| tool_call.running_session_bound_background_job())
+    }
+
+    pub fn has_running_session_bound_background_job(&self) -> bool {
+        self.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                AgentThreadEntry::ToolCall(tool_call)
+                    if tool_call.running_session_bound_background_job()
+            )
+        })
     }
 
     pub fn tool_call_for_subagent(&self, session_id: &acp::SessionId) -> Option<&ToolCall> {
@@ -4844,6 +4998,191 @@ mod tests {
         assert_eq!(command_category_from_meta(&Some(unknown)), None);
     }
 
+    #[test]
+    fn background_metadata_round_trips_and_ignores_malformed_payloads() {
+        let job = BackgroundJobInfo {
+            job_id: "bg_1".into(),
+            job_type: BackgroundJobType::Bash,
+            status: BackgroundJobStatus::Completed,
+            label: "bun run build".into(),
+            started_at: Some(1_780_000_000_000),
+            duration_ms: Some(500),
+        };
+        assert_eq!(
+            background_job_info_from_meta(&Some(meta_with_background_job_info(job.clone()))),
+            Some(job)
+        );
+
+        let legacy_job = acp::Meta::from_iter([(
+            BACKGROUND_JOB_INFO_META_KEY.into(),
+            json!({
+                "job_id": "bg_legacy",
+                "job_type": "eval",
+                "status": "running",
+                "label": "cell"
+            }),
+        )]);
+        let legacy_job = background_job_info_from_meta(&Some(legacy_job))
+            .expect("legacy background job metadata should remain readable");
+        assert_eq!(legacy_job.started_at, None);
+        assert_eq!(legacy_job.duration_ms, None);
+
+        let process = BackgroundProcessInfo {
+            process_id: "daemon-1".into(),
+            name: "web".into(),
+            state: BackgroundProcessState::Ready,
+            started_at: Some(1_780_000_000_000),
+            ready_at: Some(1_780_000_000_500),
+            exited_at: None,
+            exit_code: None,
+            exit_reason: None,
+            restart_count: 1,
+            persist: true,
+            detached: false,
+        };
+        assert_eq!(
+            background_process_info_from_meta(&Some(meta_with_background_process_info(
+                process.clone()
+            ))),
+            Some(process)
+        );
+
+        for (key, value) in [
+            (
+                BACKGROUND_JOB_INFO_META_KEY,
+                json!({"job_id": "bg_bad", "status": "future"}),
+            ),
+            (
+                BACKGROUND_PROCESS_INFO_META_KEY,
+                json!({"process_id": "daemon-bad", "state": "future"}),
+            ),
+        ] {
+            let meta = Some(acp::Meta::from_iter([(key.into(), value)]));
+            assert!(background_job_info_from_meta(&meta).is_none());
+            assert!(background_process_info_from_meta(&meta).is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn background_tool_updates_replace_typed_snapshot_and_raw_output(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let language_registry =
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let running = BackgroundJobInfo {
+                job_id: "bg_1".into(),
+                job_type: BackgroundJobType::Eval,
+                status: BackgroundJobStatus::Running,
+                label: "cell".into(),
+                started_at: Some(1_780_000_000_000),
+                duration_ms: None,
+            };
+            let mut wire_tool_call =
+                acp::ToolCall::new("eval-1", "Evaluate").raw_output(json!("first"));
+            wire_tool_call.meta = Some(meta_with_background_job_info(running));
+            let mut tool_call = ToolCall::from_acp(
+                wire_tool_call,
+                ToolCallStatus::Completed,
+                language_registry.clone(),
+                PathStyle::local(),
+                &HashMap::default(),
+                cx,
+            )
+            .expect("background tool call should decode");
+            assert!(tool_call.running_session_bound_background_job());
+
+            let completed = BackgroundJobInfo {
+                job_id: "bg_1".into(),
+                job_type: BackgroundJobType::Eval,
+                status: BackgroundJobStatus::Completed,
+                label: "cell".into(),
+                started_at: Some(1_780_000_000_000),
+                duration_ms: Some(250),
+            };
+            tool_call
+                .update_fields(
+                    acp::ToolCallUpdateFields::new().raw_output(json!("second")),
+                    Some(meta_with_background_job_info(completed.clone())),
+                    language_registry,
+                    PathStyle::local(),
+                    &HashMap::default(),
+                    cx,
+                )
+                .expect("background tool update should decode");
+
+            assert_eq!(tool_call.background_job_info, Some(completed));
+            assert!(!tool_call.running_session_bound_background_job());
+            assert_eq!(
+                tool_call
+                    .raw_output_markdown
+                    .as_ref()
+                    .expect("raw output should be rendered")
+                    .read(cx)
+                    .source()
+                    .to_string(),
+                "second"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn background_jobs_retain_idle_threads_but_processes_do_not(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| connection.new_session(project, PathList::default(), cx))
+            .await
+            .expect("test thread should open");
+
+        thread.update(cx, |thread, cx| {
+            let process = BackgroundProcessInfo {
+                process_id: "daemon-1".into(),
+                name: "web".into(),
+                state: BackgroundProcessState::Ready,
+                started_at: Some(1_780_000_000_000),
+                ready_at: Some(1_780_000_000_500),
+                exited_at: None,
+                exit_code: None,
+                exit_reason: None,
+                restart_count: 0,
+                persist: false,
+                detached: false,
+            };
+            let mut process_call =
+                acp::ToolCall::new("process-1", "web").status(acp::ToolCallStatus::Completed);
+            process_call.meta = Some(meta_with_background_process_info(process));
+            thread
+                .handle_session_update(acp::SessionUpdate::ToolCall(process_call), cx)
+                .expect("process card should decode");
+
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(!thread.has_running_session_bound_background_job());
+
+            let job = BackgroundJobInfo {
+                job_id: "bg_1".into(),
+                job_type: BackgroundJobType::Bash,
+                status: BackgroundJobStatus::Running,
+                label: "loop".into(),
+                started_at: Some(1_780_000_000_000),
+                duration_ms: None,
+            };
+            let mut job_call =
+                acp::ToolCall::new("job-1", "loop").status(acp::ToolCallStatus::Completed);
+            job_call.meta = Some(meta_with_background_job_info(job));
+            thread
+                .handle_session_update(acp::SessionUpdate::ToolCall(job_call), cx)
+                .expect("job card should decode");
+
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+            assert!(thread.has_running_session_bound_background_job());
+            assert!(
+                thread
+                    .running_session_bound_background_job(&acp::ToolCallId::new("job-1"))
+                    .is_some()
+            );
+        });
+    }
     #[test]
     fn client_user_message_id_serializes_as_string() {
         let serialized =

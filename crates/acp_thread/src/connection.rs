@@ -200,6 +200,14 @@ pub trait AgentConnection {
         None
     }
 
+    fn background_work_control(
+        &self,
+        _target: &BackgroundWorkTarget,
+        _cx: &App,
+    ) -> Option<Rc<dyn AgentBackgroundWorkControl>> {
+        None
+    }
+
     fn cancel(&self, session_id: &acp::SessionId, cx: &mut App);
 
     /// Request-scoped elicitations are connection-level because they can arrive before a session
@@ -285,6 +293,27 @@ pub trait AgentSessionClientUserMessageIds {
 
 pub trait AgentSessionRetry {
     fn run(&self, cx: &mut App) -> Task<Result<acp::PromptResponse>>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackgroundWorkTarget {
+    Job { job_id: String },
+    Process { name: String, process_id: String },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundWorkStopOutcome {
+    Cancelled,
+    AlreadyTerminal,
+}
+
+pub trait AgentBackgroundWorkControl {
+    fn stop(
+        &self,
+        session_id: &acp::SessionId,
+        target: BackgroundWorkTarget,
+        cx: &mut App,
+    ) -> Task<Result<BackgroundWorkStopOutcome>>;
 }
 
 pub trait AgentSessionSetTitle {
@@ -758,6 +787,8 @@ mod test_support {
         sessions: Arc<Mutex<HashMap<acp::SessionId, Session>>>,
         permission_requests: HashMap<acp::ToolCallId, PermissionOptions>,
         next_prompt_updates: Arc<Mutex<Vec<acp::SessionUpdate>>>,
+        background_work_stops: Arc<Mutex<Vec<(acp::SessionId, BackgroundWorkTarget)>>>,
+        supports_background_work_control: bool,
         supports_load_session: bool,
         supports_session_additional_directories: bool,
         agent_id: AgentId,
@@ -781,6 +812,8 @@ mod test_support {
                 next_prompt_updates: Default::default(),
                 permission_requests: HashMap::default(),
                 sessions: Arc::default(),
+                background_work_stops: Arc::default(),
+                supports_background_work_control: false,
                 supports_load_session: false,
                 supports_session_additional_directories: false,
                 agent_id: AgentId::new("stub"),
@@ -803,6 +836,15 @@ mod test_support {
         pub fn with_supports_load_session(mut self, supports_load_session: bool) -> Self {
             self.supports_load_session = supports_load_session;
             self
+        }
+
+        pub fn with_background_work_control(mut self) -> Self {
+            self.supports_background_work_control = true;
+            self
+        }
+
+        pub fn background_work_stops(&self) -> Vec<(acp::SessionId, BackgroundWorkTarget)> {
+            self.background_work_stops.lock().clone()
         }
 
         pub fn with_supports_session_additional_directories(
@@ -1028,6 +1070,18 @@ mod test_support {
             }))
         }
 
+        fn background_work_control(
+            &self,
+            _target: &BackgroundWorkTarget,
+            _cx: &App,
+        ) -> Option<Rc<dyn AgentBackgroundWorkControl>> {
+            self.supports_background_work_control.then(|| {
+                Rc::new(StubAgentBackgroundWorkControl {
+                    stops: self.background_work_stops.clone(),
+                }) as Rc<dyn AgentBackgroundWorkControl>
+            })
+        }
+
         fn cancel(&self, session_id: &acp::SessionId, _cx: &mut App) {
             if let Some(end_turn_tx) = self
                 .sessions
@@ -1059,6 +1113,22 @@ mod test_support {
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
+        }
+    }
+
+    struct StubAgentBackgroundWorkControl {
+        stops: Arc<Mutex<Vec<(acp::SessionId, BackgroundWorkTarget)>>>,
+    }
+
+    impl AgentBackgroundWorkControl for StubAgentBackgroundWorkControl {
+        fn stop(
+            &self,
+            session_id: &acp::SessionId,
+            target: BackgroundWorkTarget,
+            _cx: &mut App,
+        ) -> Task<Result<BackgroundWorkStopOutcome>> {
+            self.stops.lock().push((session_id.clone(), target));
+            Task::ready(Ok(BackgroundWorkStopOutcome::Cancelled))
         }
     }
 
