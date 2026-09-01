@@ -5145,6 +5145,103 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_parent_cancel_keeps_subagent_running_until_terminal_update(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = SubagentLoadConnection::default();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        let parent_thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _cx| view.thread.clone());
+        let parent_session_id =
+            parent_thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let subagent_id = acp::SessionId::new("cancel-surviving-child");
+        let parent_tool_call_id = acp::ToolCallId::new("spawn-cancel-surviving-child");
+        parent_thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(parent_tool_call_id.clone(), "Spawn child")
+                            .status(acp::ToolCallStatus::InProgress)
+                            .meta(acp::Meta::from_iter([(
+                                "subagent_session_info".to_string(),
+                                json!({
+                                    "session_id": subagent_id.clone(),
+                                    "message_start_index": 0
+                                }),
+                            )])),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        conversation_view.update_in(cx, |view, window, cx| {
+            view.load_subagent_session(subagent_id.clone(), parent_session_id.clone(), window, cx);
+        });
+        cx.run_until_parked();
+
+        let child_thread = conversation_view.read_with(cx, |view, cx| {
+            view.as_connected()
+                .unwrap()
+                .threads
+                .get(&subagent_id)
+                .unwrap()
+                .read(cx)
+                .thread
+                .clone()
+        });
+        child_thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+        });
+        let child_stopped = Arc::new(AtomicBool::new(false));
+        let _child_subscription = cx.update(|_window, cx| {
+            let child_stopped = child_stopped.clone();
+            cx.subscribe(&child_thread, move |_thread, event, _cx| {
+                if matches!(event, AcpThreadEvent::Stopped(acp::StopReason::EndTurn)) {
+                    child_stopped.store(true, Ordering::SeqCst);
+                }
+            })
+        });
+
+        let cancel = parent_thread.update(cx, |thread, cx| {
+            // Model an active parent turn without involving a second prompt
+            // transport; AcpThread::cancel then exercises the same local entry
+            // cancellation path used by Send Now.
+            thread.set_external_subagent_running(true, cx);
+            thread.cancel(cx)
+        });
+        cancel.await;
+        parent_thread.update(cx, |thread, cx| {
+            thread.set_external_subagent_running(false, cx);
+        });
+        cx.run_until_parked();
+
+        child_thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Generating);
+        });
+        assert!(!child_stopped.load(Ordering::SeqCst));
+
+        parent_thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        parent_tool_call_id,
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+        child_thread.read_with(cx, |thread, _cx| {
+            assert_eq!(thread.status(), ThreadStatus::Idle);
+        });
+        assert!(child_stopped.load(Ordering::SeqCst));
+    }
+
+    #[gpui::test]
     async fn test_failed_subagent_load_clears_pending_and_can_retry(cx: &mut TestAppContext) {
         init_test(cx);
 

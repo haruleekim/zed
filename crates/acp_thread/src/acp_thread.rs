@@ -4099,7 +4099,7 @@ impl AcpThread {
             return Task::ready(());
         }
 
-        self.mark_pending_entries_as_canceled(permission_outcome, cx);
+        self.mark_pending_entries_as_canceled(permission_outcome, true, cx);
         self.connection.cancel(&self.session_id, cx);
         if self.status() != previous_status {
             cx.emit(AcpThreadEvent::StatusChanged);
@@ -4113,24 +4113,30 @@ impl AcpThread {
     }
 
     fn cancel_pending_turn_entries(&mut self, cx: &mut Context<Self>) {
-        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, cx);
+        self.mark_pending_entries_as_canceled(RequestPermissionOutcome::Cancelled, false, cx);
         self.cancel_outstanding_elicitations(cx);
     }
 
     fn mark_pending_entries_as_canceled(
         &mut self,
         permission_outcome: RequestPermissionOutcome,
+        preserve_subagent_cards: bool,
         cx: &mut Context<Self>,
     ) {
         for (ix, entry) in self.entries.iter_mut().enumerate() {
             match entry {
                 AgentThreadEntry::ToolCall(call) => {
-                    let cancel = matches!(
-                        call.status,
-                        ToolCallStatus::Pending
-                            | ToolCallStatus::WaitingForConfirmation { .. }
-                            | ToolCallStatus::InProgress
-                    );
+                    // A direct user cancel cannot know whether server-owned subagent
+                    // work is detached, so it waits for the ACP lifecycle update.
+                    // Turn-failure cleanup preserves nothing because no later server
+                    // response is guaranteed to settle stale entries.
+                    let cancel = (!preserve_subagent_cards || call.subagent_session_info.is_none())
+                        && matches!(
+                            call.status,
+                            ToolCallStatus::Pending
+                                | ToolCallStatus::WaitingForConfirmation { .. }
+                                | ToolCallStatus::InProgress
+                        );
                     if cancel {
                         let previous_status =
                             mem::replace(&mut call.status, ToolCallStatus::Canceled);
@@ -7913,6 +7919,126 @@ mod tests {
             connection.cancelled_sessions.borrow().as_slice(),
             [child_session_id]
         );
+    }
+
+    #[gpui::test]
+    async fn test_cancel_preserves_server_owned_subagent_tool_call(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.clone().new_session(
+                    project,
+                    PathList::new(&[Path::new(path!("/test"))]),
+                    cx,
+                )
+            })
+            .await
+            .unwrap();
+        let session_id = thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        let ordinary_tool_call_id = acp::ToolCallId::new("ordinary-tool");
+        let subagent_tool_call_id = acp::ToolCallId::new("server-owned-subagent");
+        let child_session_id = acp::SessionId::new("child-session");
+        thread
+            .update(cx, |thread, cx| {
+                thread.set_external_subagent_running(true, cx);
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(ordinary_tool_call_id.clone(), "Ordinary tool")
+                            .status(acp::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )?;
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(subagent_tool_call_id.clone(), "Server-owned subagent")
+                            .status(acp::ToolCallStatus::InProgress)
+                            .meta(acp::Meta::from_iter([(
+                                SUBAGENT_SESSION_INFO_META_KEY.to_string(),
+                                json!({
+                                    "session_id": child_session_id,
+                                    "message_start_index": 0
+                                }),
+                            )])),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, ordinary_tool_call) = thread.tool_call(&ordinary_tool_call_id).unwrap();
+            assert!(matches!(
+                ordinary_tool_call.status,
+                ToolCallStatus::Canceled
+            ));
+            let (_, subagent_tool_call) = thread.tool_call(&subagent_tool_call_id).unwrap();
+            assert!(matches!(
+                subagent_tool_call.status,
+                ToolCallStatus::InProgress
+            ));
+        });
+        assert_eq!(
+            connection.cancelled_sessions.borrow().as_slice(),
+            [session_id]
+        );
+
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                        subagent_tool_call_id.clone(),
+                        acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                    )),
+                    cx,
+                )
+            })
+            .unwrap();
+        thread.read_with(cx, |thread, _cx| {
+            let (_, subagent_tool_call) = thread.tool_call(&subagent_tool_call_id).unwrap();
+            assert!(matches!(
+                subagent_tool_call.status,
+                ToolCallStatus::Completed
+            ));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_turn_failure_cancels_server_owned_subagent_tool_call(cx: &mut TestAppContext) {
+        init_test(cx);
+        let thread = new_test_thread(cx).await;
+        let tool_call_id = acp::ToolCallId::new("failed-turn-subagent");
+        thread
+            .update(cx, |thread, cx| {
+                thread.handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_call_id.clone(), "Failed turn subagent")
+                            .status(acp::ToolCallStatus::InProgress)
+                            .meta(acp::Meta::from_iter([(
+                                SUBAGENT_SESSION_INFO_META_KEY.to_string(),
+                                json!({
+                                    "session_id": "failed-turn-child",
+                                    "message_start_index": 0
+                                }),
+                            )])),
+                    ),
+                    cx,
+                )
+            })
+            .unwrap();
+
+        thread.update(cx, |thread, cx| {
+            thread.cancel_pending_turn_entries(cx);
+        });
+
+        thread.read_with(cx, |thread, _cx| {
+            let (_, tool_call) = thread.tool_call(&tool_call_id).unwrap();
+            assert!(matches!(tool_call.status, ToolCallStatus::Canceled));
+        });
     }
 
     #[gpui::test]
