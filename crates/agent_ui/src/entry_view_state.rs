@@ -1,6 +1,8 @@
 use std::{ops::Range, sync::Arc};
 
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk};
+use acp_thread::{
+    AcpThread, AgentThreadEntry, AssistantMessageChunk, ContentBlock, ToolCallContent,
+};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
@@ -48,6 +50,7 @@ pub struct EntryViewState {
     user_toggled_thinking_blocks: HashSet<(usize, usize)>,
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
+    initialized_execute_resource_expansion: HashSet<acp::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -70,6 +73,7 @@ impl EntryViewState {
             user_toggled_thinking_blocks: HashSet::default(),
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
+            initialized_execute_resource_expansion: HashSet::default(),
         }
     }
 
@@ -283,6 +287,25 @@ impl EntryViewState {
             }
             AgentThreadEntry::ToolCall(tool_call) => {
                 let id = tool_call.id.clone();
+                let has_execute_resource = tool_call.kind == acp::ToolKind::Execute
+                    && tool_call.content.iter().any(|content| {
+                        matches!(
+                            content,
+                            ToolCallContent::ContentBlock(ContentBlock::EmbeddedResource {
+                                markdown: Some(_),
+                                ..
+                            })
+                        )
+                    });
+                if has_execute_resource
+                    && self
+                        .initialized_execute_resource_expansion
+                        .insert(id.clone())
+                    && AgentSettings::get_global(cx).expand_terminal_card
+                {
+                    self.expanded_tool_calls.insert(id.clone());
+                }
+
                 let terminals = tool_call.terminals().cloned().collect::<Vec<_>>();
                 let diffs = tool_call.diffs().cloned().collect::<Vec<_>>();
 
