@@ -7883,6 +7883,7 @@ impl ThreadView {
         &self,
         group: SharedString,
         is_preview: bool,
+        preview_expansion: Option<(usize, acp::ToolCallId, bool)>,
         command: Entity<Markdown>,
         window: &Window,
         cx: &Context<Self>,
@@ -7909,14 +7910,36 @@ impl ThreadView {
         style.code_block_overflow_x_scroll = false;
 
         let header_bg = self.tool_card_header_bg(cx);
+        let preview_disclosure = preview_expansion.map(|(entry_ix, tool_call_id, is_expanded)| {
+            let selector = SharedString::from(format!("execute-tool-output-disclosure-{entry_ix}"));
+            div()
+                .id(selector.clone())
+                .debug_selector(move || selector.to_string())
+                .child(
+                    Disclosure::new(("expand-execute-output", entry_ix), is_expanded)
+                        .opened_icon(IconName::ChevronUp)
+                        .closed_icon(IconName::ChevronDown)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.entry_view_state.update(cx, |state, _cx| {
+                                state.toggle_tool_call_expansion(&tool_call_id);
+                            });
+                            this.refresh_thread_search(window, cx);
+                            cx.notify();
+                        })),
+                )
+        });
         let run_command_label = if is_preview {
             Some(
-                h_flex().h_6().child(
-                    Label::new("Run Command")
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted),
-                ),
+                h_flex()
+                    .h_6()
+                    .justify_between()
+                    .child(
+                        Label::new("Run Command")
+                            .buffer_font(cx)
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .children(preview_disclosure),
             )
         } else {
             None
@@ -8005,6 +8028,7 @@ impl ThreadView {
         let command_element = self.render_collapsible_command(
             header_group.clone(),
             false,
+            None,
             tool_call.label.clone(),
             window,
             cx,
@@ -8825,6 +8849,7 @@ impl ThreadView {
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
                         true,
+                        is_collapsible.then(|| (entry_ix, tool_call.id.clone(), is_open)),
                         tool_call.label.clone(),
                         window,
                         cx,

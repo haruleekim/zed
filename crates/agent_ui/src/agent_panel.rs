@@ -7254,13 +7254,16 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_execute_embedded_resource_is_expanded_without_manual_interaction(
+    async fn test_execute_embedded_resource_can_expand_when_terminal_cards_default_collapsed(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
         cx.update(|cx| {
             agent::ThreadStore::init_global(cx);
             language_model::LanguageModelRegistry::test(cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.expand_terminal_card = false;
+            AgentSettings::override_global(settings, cx);
         });
 
         let fs = FakeFs::new(cx.executor());
@@ -7320,8 +7323,17 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
+            cx.debug_bounds("tool-call-output-0-0").is_none(),
+            "execute tool source should respect the collapsed terminal-card setting"
+        );
+        let disclosure = cx
+            .debug_bounds("execute-tool-output-disclosure-0")
+            .expect("collapsed execute tool source should expose a disclosure");
+        cx.simulate_click(disclosure.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(
             cx.debug_bounds("tool-call-output-0-0").is_some(),
-            "execute tool source should render without manually expanding the card"
+            "clicking the execute tool disclosure should reveal its source"
         );
     }
 

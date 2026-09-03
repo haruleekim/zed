@@ -298,10 +298,10 @@ impl EntryViewState {
                         )
                     });
                 if has_execute_resource
+                    && AgentSettings::get_global(cx).expand_terminal_card
                     && self
                         .initialized_execute_resource_expansion
                         .insert(id.clone())
-                    && AgentSettings::get_global(cx).expand_terminal_card
                 {
                     self.expanded_tool_calls.insert(id.clone());
                 }
