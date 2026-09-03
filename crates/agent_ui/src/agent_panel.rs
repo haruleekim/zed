@@ -7345,6 +7345,125 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_multi_file_acp_diffs_render_without_raw_preview_duplicates(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+            let mut settings = AgentSettings::get_global(cx).clone();
+            settings.expand_edit_card = true;
+            AgentSettings::override_global(settings, cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let connection = StubAgentConnection::new();
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel
+        });
+        open_thread_with_connection(&panel, connection.clone(), cx);
+
+        let session_id = active_session_id(&panel, cx);
+        let large_before = format!("before\n{}", "large line\n".repeat(43_000));
+        let large_after = format!("after\n{}", "large line\n".repeat(43_000));
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("multi-diff", "Edit three files")
+                        .kind(acp::ToolKind::Edit)
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec![
+                            acp::ToolCallContent::Diff(
+                                acp::Diff::new("/project/small.ts", "after").old_text("before"),
+                            ),
+                            acp::ToolCallContent::Diff(
+                                acp::Diff::new("/project/large.ts", large_after)
+                                    .old_text(large_before),
+                            ),
+                            acp::ToolCallContent::Diff(acp::Diff::new(
+                                "/project/created.ts",
+                                "created",
+                            )),
+                        ]),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new("partial-diff", "Edit with fallback")
+                        .kind(acp::ToolKind::Edit)
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec![
+                            acp::ToolCallContent::Diff(
+                                acp::Diff::new("/project/kept.ts", "after").old_text("before"),
+                            ),
+                            acp::ToolCallContent::Content(acp::Content::new(
+                                acp::ContentBlock::Text(acp::TextContent::new(
+                                    "Diff preview unavailable:\n- /project/huge.ts: file-limit",
+                                )),
+                            )),
+                        ]),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let thread_view = panel.read_with(cx, |panel, cx| panel.active_thread_view(cx).unwrap());
+        thread_view.update(cx, |thread_view, cx| {
+            thread_view.entry_view_state.update(cx, |state, _cx| {
+                state.expand_tool_call(acp::ToolCallId::new("multi-diff"));
+                state.expand_tool_call(acp::ToolCallId::new("partial-diff"));
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        for (content_index, selector) in [
+            "tool-call-output-0-0",
+            "tool-call-output-0-1",
+            "tool-call-output-0-2",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "every complete-coverage diff should render at index {content_index}"
+            );
+        }
+        assert!(
+            cx.debug_bounds("tool-call-output-0-3").is_none(),
+            "complete diff coverage should not render a raw preview"
+        );
+        assert!(cx.debug_bounds("tool-call-output-1-0").is_some());
+        assert!(cx.debug_bounds("tool-call-output-1-1").is_some());
+        assert!(
+            cx.debug_bounds("tool-call-output-1-2").is_none(),
+            "partial fallback should not duplicate the successful native diff"
+        );
+    }
+
+    #[gpui::test]
     async fn test_background_stop_buttons_dispatch_scoped_targets(cx: &mut TestAppContext) {
         init_test(cx);
         cx.update(|cx| {
