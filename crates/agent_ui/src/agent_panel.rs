@@ -7329,6 +7329,13 @@ mod tests {
         let disclosure = cx
             .debug_bounds("execute-tool-output-disclosure-0")
             .expect("collapsed execute tool source should expose a disclosure");
+        let copy_button = cx
+            .debug_bounds("inner-tool-call-header-0-copy-command")
+            .expect("execute tool source should expose a copy button");
+        assert!(
+            !copy_button.intersects(&disclosure),
+            "execute tool copy and disclosure controls should not overlap"
+        );
         cx.simulate_click(disclosure.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(

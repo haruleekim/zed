@@ -7932,6 +7932,7 @@ impl ThreadView {
             Some(
                 h_flex()
                     .h_6()
+                    .pr(rems(2.))
                     .justify_between()
                     .child(
                         Label::new("Run Command")
@@ -7955,6 +7956,7 @@ impl ThreadView {
                 border: false,
             });
         let copy_button_id = SharedString::from(format!("{group}-copy-command"));
+        let copy_button_selector = copy_button_id.clone();
         let copy_button = CopyButton::new(copy_button_id, command_text)
             .tooltip_label("Copy Command")
             .visible_on_hover(group.clone());
@@ -7966,7 +7968,14 @@ impl ThreadView {
             .bg(header_bg)
             .when(is_preview, |this| this.pt_1().children(run_command_label))
             .child(markdown_element)
-            .child(div().absolute().top_1().right_1().child(copy_button))
+            .child(
+                div()
+                    .absolute()
+                    .top_1()
+                    .right_1()
+                    .debug_selector(move || copy_button_selector.to_string())
+                    .child(copy_button),
+            )
     }
 
     fn render_terminal_tool_call(
