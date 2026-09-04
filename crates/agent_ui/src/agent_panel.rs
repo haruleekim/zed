@@ -7293,7 +7293,7 @@ mod tests {
             connection.send_update(
                 session_id.clone(),
                 acp::SessionUpdate::ToolCall(
-                    acp::ToolCall::new(tool_call_id.clone(), "[py] inspect image")
+                    acp::ToolCall::new(tool_call_id.clone(), "inspect image")
                         .kind(acp::ToolKind::Execute)
                         .status(acp::ToolCallStatus::InProgress),
                 ),

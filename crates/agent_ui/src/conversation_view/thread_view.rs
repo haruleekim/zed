@@ -851,6 +851,108 @@ fn background_card_output(
     raw_output_markdown.cloned().into_iter().collect()
 }
 
+/// How a card names the runtime that executes the source of a call.
+///
+/// `icon_type` is an icon-theme file type, so a Python cell is drawn with the
+/// same glyph the project panel gives `main.py`. `None` keeps the terminal
+/// icon, which names a shell better than any file glyph.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceRuntime {
+    icon_type: Option<&'static str>,
+    label: &'static str,
+}
+
+/// Mime types agents declare on call source, and the runtime each one names.
+/// One table drives both the routing (is this resource the call's source?) and
+/// the card header, so a new runtime cannot get a header label without also
+/// getting a syntax-highlighted source section.
+const TOOL_SOURCE_RUNTIMES: &[(&str, SourceRuntime)] = &[
+    (
+        "text/x-shellscript",
+        SourceRuntime {
+            icon_type: None,
+            label: "Shell",
+        },
+    ),
+    (
+        "text/x-python",
+        SourceRuntime {
+            icon_type: Some("python"),
+            label: "Python",
+        },
+    ),
+    (
+        "text/javascript",
+        SourceRuntime {
+            icon_type: Some("javascript"),
+            label: "JavaScript",
+        },
+    ),
+    (
+        "text/x-ruby",
+        SourceRuntime {
+            icon_type: Some("ruby"),
+            label: "Ruby",
+        },
+    ),
+    (
+        "text/x-julia",
+        SourceRuntime {
+            icon_type: Some("julia"),
+            label: "Julia",
+        },
+    ),
+];
+
+/// An execute call whose source the agent didn't attach: still a command, just
+/// not a runtime we can name.
+const UNNAMED_SOURCE_RUNTIME: SourceRuntime = SourceRuntime {
+    icon_type: None,
+    label: "Command",
+};
+
+impl SourceRuntime {
+    fn icon(self, cx: &App) -> Icon {
+        self.icon_type
+            .and_then(|icon_type| FileIcons::get(cx).get_icon_for_type(icon_type, cx))
+            .map(Icon::from_path)
+            .unwrap_or_else(|| Icon::new(IconName::Terminal))
+    }
+}
+
+/// Whether an embedded resource is the *source of the call* rather than its
+/// output: a shell command, an eval cell. Agents attach these so the client
+/// can syntax-highlight what runs; identified by a source mime type, so no
+/// vendor-specific uri scheme is baked in here.
+fn is_tool_source_resource(resource: &acp::EmbeddedResource) -> bool {
+    tool_source_resource_runtime(resource).is_some()
+}
+
+fn tool_source_resource_runtime(resource: &acp::EmbeddedResource) -> Option<SourceRuntime> {
+    let acp::EmbeddedResourceResource::TextResourceContents(text) = &resource.resource else {
+        return None;
+    };
+    let mime_type = text.mime_type.as_deref()?;
+    TOOL_SOURCE_RUNTIMES
+        .iter()
+        .find(|(candidate, _)| *candidate == mime_type)
+        .map(|(_, runtime)| *runtime)
+}
+
+/// Names the runtime an execute card ran its source in. The source resource
+/// carries the language, so the agent doesn't have to spend the card's title
+/// line on a `[py]`-style tag.
+fn tool_call_source_runtime(content: &[ToolCallContent]) -> SourceRuntime {
+    content
+        .iter()
+        .filter_map(|content| match content {
+            ToolCallContent::ContentBlock(block) => block.embedded_resource(),
+            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => None,
+        })
+        .find_map(|(resource, _)| tool_source_resource_runtime(resource))
+        .unwrap_or(UNNAMED_SOURCE_RUNTIME)
+}
+
 impl ToolCallLayout {
     /// Stable discriminant used to disambiguate element ids when the same tool
     /// call is rendered in more than one layout at once (e.g. inline in the
@@ -7918,7 +8020,7 @@ impl ThreadView {
     fn render_collapsible_command(
         &self,
         group: SharedString,
-        is_preview: bool,
+        runtime: Option<SourceRuntime>,
         preview_expansion: Option<(usize, acp::ToolCallId, bool)>,
         command: Entity<Markdown>,
         window: &Window,
@@ -7958,29 +8060,21 @@ impl ThreadView {
                         })),
                 )
         });
-        let run_command_label = if is_preview {
-            Some(
-                h_flex()
-                    .h_6()
-                    // Reserve the top-right corner for the sole hover control
-                    // (the expand chevron) so the label never runs under it.
-                    .pr(rems(2.))
-                    .gap_1p5()
-                    .child(
-                        Icon::new(IconName::Terminal)
-                            .size(IconSize::XSmall)
-                            .color(Color::Muted),
-                    )
-                    .child(
-                        Label::new("Run Command")
-                            .buffer_font(cx)
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
-        } else {
-            None
-        };
+        let runtime_label = runtime.map(|runtime| {
+            h_flex()
+                .h_6()
+                // Reserve the top-right corner for the sole hover control
+                // (the expand chevron) so the label never runs under it.
+                .pr(rems(2.))
+                .gap_1p5()
+                .child(runtime.icon(cx).size(IconSize::XSmall).color(Color::Muted))
+                .child(
+                    Label::new(runtime.label)
+                        .buffer_font(cx)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+        });
         // The card's source section renders the command as its own code block
         // with the crate's hover copy button, so the title needs no copy
         // affordance of its own — a second one would copy the title text
@@ -7998,7 +8092,7 @@ impl ThreadView {
             .relative()
             .p_1p5()
             .bg(header_bg)
-            .when(is_preview, |this| this.pt_1().children(run_command_label))
+            .when_some(runtime_label, |this, label| this.pt_1().child(label))
             .child(markdown_element)
             .child(
                 h_flex()
@@ -8067,7 +8161,7 @@ impl ThreadView {
 
         let command_element = self.render_collapsible_command(
             header_group.clone(),
-            false,
+            None,
             None,
             tool_call.label.clone(),
             window,
@@ -8896,7 +8990,7 @@ impl ThreadView {
                 if is_terminal_tool {
                     this.child(self.render_collapsible_command(
                         card_header_id.clone(),
-                        true,
+                        Some(tool_call_source_runtime(&tool_call.content)),
                         is_collapsible.then(|| (entry_ix, tool_call.id.clone(), is_open)),
                         tool_call.label.clone(),
                         window,
@@ -10687,7 +10781,7 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         if let Some(markdown) = markdown {
-            if Self::is_tool_source_resource(resource) {
+            if is_tool_source_resource(resource) {
                 return self.render_tool_source_section(markdown, card_layout, window, cx);
             }
             return self.render_markdown_output(
@@ -10730,27 +10824,6 @@ impl ThreadView {
                 )
             })
             .into_any_element()
-    }
-
-    /// Whether an embedded resource is the *source of the call* rather than its
-    /// output: a shell command, an eval cell. Agents attach these so the client
-    /// can syntax-highlight what runs; identified by a source mime type, so no
-    /// vendor-specific uri scheme is baked in here.
-    fn is_tool_source_resource(resource: &acp::EmbeddedResource) -> bool {
-        let mime_type = match &resource.resource {
-            acp::EmbeddedResourceResource::TextResourceContents(text) => text.mime_type.as_deref(),
-            _ => None,
-        };
-        mime_type.is_some_and(|mime| {
-            matches!(
-                mime,
-                "text/x-shellscript"
-                    | "text/x-python"
-                    | "text/javascript"
-                    | "text/x-ruby"
-                    | "text/x-julia"
-            )
-        })
     }
 
     /// Render call source as a card section, the way a diff card renders its
@@ -13595,6 +13668,54 @@ mod tests {
 
             assert!(background_card_output(&[], None, cx).is_empty());
         });
+    }
+
+    #[test]
+    fn execute_card_names_the_runtime_of_its_source_resource() {
+        let resource = |mime: &str| {
+            acp::EmbeddedResource::new(acp::EmbeddedResourceResource::TextResourceContents(
+                acp::TextResourceContents::new("print(1)", "omp-eval://tool/t/cell-0.py")
+                    .mime_type(mime.to_string()),
+            ))
+        };
+        let block = |mime: &str| {
+            ToolCallContent::ContentBlock(acp_thread::ContentBlock::EmbeddedResource {
+                resource: resource(mime),
+                markdown: None,
+            })
+        };
+
+        // A language runtime is named and drawn with its own glyph, which is
+        // what lets the agent keep the title line for what the cell does.
+        assert_eq!(
+            tool_call_source_runtime(&[block("text/x-python")]),
+            SourceRuntime {
+                icon_type: Some("python"),
+                label: "Python",
+            }
+        );
+        // A shell keeps the terminal icon; no file glyph names it better.
+        assert_eq!(
+            tool_call_source_runtime(&[block("text/x-shellscript")]),
+            SourceRuntime {
+                icon_type: None,
+                label: "Shell",
+            }
+        );
+        // Resources that aren't call source (a plan card's markdown) must not
+        // stop the scan, and must not be routed to the source section either.
+        assert_eq!(
+            tool_call_source_runtime(&[block("text/markdown"), block("text/x-ruby")]).label,
+            "Ruby"
+        );
+        assert!(!is_tool_source_resource(&resource("text/markdown")));
+        assert!(is_tool_source_resource(&resource("text/x-julia")));
+        // Agents that attach no source still get a card that names itself.
+        assert_eq!(
+            tool_call_source_runtime(&[block("text/markdown")]),
+            UNNAMED_SOURCE_RUNTIME
+        );
+        assert_eq!(tool_call_source_runtime(&[]), UNNAMED_SOURCE_RUNTIME);
     }
 }
 
