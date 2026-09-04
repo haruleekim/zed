@@ -7409,7 +7409,7 @@ mod tests {
         // way for the rest of the session.
         cx.update(|_window, cx| {
             connection.send_update(
-                session_id,
+                session_id.clone(),
                 acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
                     tool_call_id,
                     acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
@@ -7421,6 +7421,46 @@ mod tests {
         assert!(
             cx.debug_bounds("tool-call-output-0-0").is_some(),
             "an advisory should keep its note visible across updates"
+        );
+
+        // An advisory is a note, not a call: the `Raw Input:`/`Output:` section
+        // framed it as tool plumbing and, with no raw input to show, left an
+        // empty header above every note. A plain think-kind call in the same
+        // thread still gets it, so this is a real distinction and not an
+        // assertion that passes because nothing renders.
+        assert!(
+            cx.debug_bounds("tool-call-raw-input-0").is_none(),
+            "an advisory should not be framed as tool input and output"
+        );
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(acp::ToolCallId::new("think-1"), "Thinking it over")
+                        .kind(acp::ToolKind::Think)
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+                            acp::ContentBlock::from("considered"),
+                        ))]),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        panel.update_in(cx, |panel, _window, cx| {
+            let thread = panel
+                .active_thread_view(cx)
+                .expect("thread view should exist");
+            let entry_view_state = thread.read(cx).entry_view_state.clone();
+            entry_view_state.update(cx, |state, _cx| {
+                state.expand_tool_call(acp::ToolCallId::new("think-1"));
+            });
+            thread.update(cx, |_thread, cx| cx.notify());
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-call-raw-input-1").is_some(),
+            "a plain tool call still reports its input and output sections"
         );
     }
 

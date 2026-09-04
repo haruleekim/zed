@@ -8778,7 +8778,12 @@ impl ThreadView {
 
         let has_image_content = tool_call.content.iter().any(|c| c.image().is_some());
 
-        let should_show_raw_input = !is_terminal_tool && !is_edit && !has_image_content;
+        // An advisory is a note someone wrote, not a call with an input and an
+        // output: those headers framed it as tool plumbing and left an empty
+        // `Raw Input:` above every note.
+        let is_advisory = tool_call.advisor_notes.is_some();
+        let should_show_raw_input =
+            !is_terminal_tool && !is_edit && !has_image_content && !is_advisory;
 
         let has_content = !tool_call.content.is_empty()
             || (should_show_raw_input && tool_call.raw_input.is_some());
@@ -8925,8 +8930,12 @@ impl ThreadView {
                 | ToolCallStatus::Failed
                 | ToolCallStatus::Canceled => v_flex()
                     .when(should_show_raw_input, |this| {
+                        let section_id =
+                            SharedString::from(format!("tool-call-raw-input-{entry_ix}"));
                         this.mt_1p5().w_full().child(
                             v_flex()
+                                .id(section_id.clone())
+                                .debug_selector(move || section_id.to_string())
                                 .ml(rems(0.4))
                                 .px_3p5()
                                 .pb_1()
@@ -8972,7 +8981,10 @@ impl ThreadView {
                                     ))
                             }),
                     )
-                    .when(!use_card_layout, |this| {
+                    // Advisories keep only the header chevron: a full-width
+                    // collapse bar under a two-line note is more chrome than
+                    // note.
+                    .when(!use_card_layout && !is_advisory, |this| {
                         let button_id =
                             SharedString::from(format!("tool_output-collapse-{:?}", tool_call.id));
                         let tool_call_id = tool_call.id.clone();
@@ -11069,10 +11081,14 @@ impl ThreadView {
                             .border_color(self.tool_card_border_color(cx))
                     })
                 } else {
-                    this.ml(rems(0.4))
-                        .px_3p5()
-                        .border_l_1()
-                        .border_color(self.tool_card_border_color(cx))
+                    // An advisory reads as a quoted aside, so its rail carries
+                    // the severity the same way the agent's terminal UI tints
+                    // its own advisor rail.
+                    let rail = match tool_call.advisor_notes.as_deref() {
+                        Some(notes) => advisory_severity_color(notes).color(cx),
+                        None => self.tool_card_border_color(cx),
+                    };
+                    this.ml(rems(0.4)).px_3p5().border_l_1().border_color(rail)
                 }
             })
             .text_xs()
