@@ -7924,15 +7924,6 @@ impl ThreadView {
         window: &Window,
         cx: &Context<Self>,
     ) -> Div {
-        // The label's markdown source is a fenced code block (```\n...\n```);
-        // strip the fences so the copy button yields just the command text.
-        let command_source = command.read(cx).source();
-        let command_text = command_source
-            .strip_prefix("```\n")
-            .and_then(|s| s.strip_suffix("\n```"))
-            .unwrap_or(&command_source)
-            .to_string();
-
         let mut style =
             MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
         style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
@@ -7955,6 +7946,9 @@ impl ThreadView {
                     Disclosure::new(("expand-execute-output", entry_ix), is_expanded)
                         .opened_icon(IconName::ChevronUp)
                         .closed_icon(IconName::ChevronDown)
+                        // Matches the copy button: card chrome stays out of the
+                        // way until the card is hovered.
+                        .visible_on_hover(group.clone())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.entry_view_state.update(cx, |state, _cx| {
                                 state.toggle_tool_call_expansion(&tool_call_id);
@@ -7968,22 +7962,29 @@ impl ThreadView {
             Some(
                 h_flex()
                     .h_6()
+                    // Reserve the top-right corner for the sole hover control
+                    // (the expand chevron) so the label never runs under it.
                     .pr(rems(2.))
-                    .justify_between()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
                     .child(
                         Label::new("Run Command")
                             .buffer_font(cx)
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
-                    )
-                    .children(preview_disclosure),
+                    ),
             )
         } else {
             None
         };
-        // Suppress the code block's built-in copy button so we don't stack two
-        // copy buttons on top of each other; the outer button below is the one
-        // we want, because it copies the unfenced command text.
+        // The card's source section renders the command as its own code block
+        // with the crate's hover copy button, so the title needs no copy
+        // affordance of its own — a second one would copy the title text
+        // (the model's intent phrase), not the command.
         let markdown_element = self
             .render_markdown(command, style, cx)
             .code_block_renderer(CodeBlockRenderer::Default {
@@ -7991,11 +7992,6 @@ impl ThreadView {
                 wrap_button_visibility: markdown::WrapButtonVisibility::Hidden,
                 border: false,
             });
-        let copy_button_id = SharedString::from(format!("{group}-copy-command"));
-        let copy_button_selector = copy_button_id.clone();
-        let copy_button = CopyButton::new(copy_button_id, command_text)
-            .tooltip_label("Copy Command")
-            .visible_on_hover(group.clone());
 
         v_flex()
             .group(group)
@@ -8005,12 +8001,11 @@ impl ThreadView {
             .when(is_preview, |this| this.pt_1().children(run_command_label))
             .child(markdown_element)
             .child(
-                div()
+                h_flex()
                     .absolute()
                     .top_1()
                     .right_1()
-                    .debug_selector(move || copy_button_selector.to_string())
-                    .child(copy_button),
+                    .children(preview_disclosure),
             )
     }
 
@@ -10692,6 +10687,9 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         if let Some(markdown) = markdown {
+            if Self::is_tool_source_resource(resource) {
+                return self.render_tool_source_section(markdown, card_layout, window, cx);
+            }
             return self.render_markdown_output(
                 markdown,
                 entry_ix,
@@ -10731,6 +10729,67 @@ impl ThreadView {
                         .color(Color::Muted),
                 )
             })
+            .into_any_element()
+    }
+
+    /// Whether an embedded resource is the *source of the call* rather than its
+    /// output: a shell command, an eval cell. Agents attach these so the client
+    /// can syntax-highlight what runs; identified by a source mime type, so no
+    /// vendor-specific uri scheme is baked in here.
+    fn is_tool_source_resource(resource: &acp::EmbeddedResource) -> bool {
+        let mime_type = match &resource.resource {
+            acp::EmbeddedResourceResource::TextResourceContents(text) => text.mime_type.as_deref(),
+            _ => None,
+        };
+        mime_type.is_some_and(|mime| {
+            matches!(
+                mime,
+                "text/x-shellscript"
+                    | "text/x-python"
+                    | "text/javascript"
+                    | "text/x-ruby"
+                    | "text/x-julia"
+            )
+        })
+    }
+
+    /// Render call source as a card section, the way a diff card renders its
+    /// hunks: a divider separates it from the header, the code fills the card
+    /// width, and long lines soft-wrap. The nested code-block frame (its own
+    /// background, padding and rounded corners) is dropped — the card already
+    /// provides one, and inside it the frame clipped wide commands.
+    fn render_tool_source_section(
+        &self,
+        markdown: Entity<Markdown>,
+        card_layout: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let mut style =
+            MarkdownStyle::themed(MarkdownFont::Agent, window, cx).with_agent_buffer_font(cx);
+        style.container_style.text.font_size = Some(rems_from_px(12_f32).into());
+        style.container_style.text.line_height = Some(rems_from_px(17_f32).into());
+        style.height_is_multiple_of_line_height = true;
+        style.code_block_overflow_x_scroll = false;
+        style.code_block = gpui::StyleRefinement::default();
+
+        v_flex()
+            .map(|this| {
+                if card_layout {
+                    // Always divided, unlike a plain output block: call source
+                    // is the first section under the card header, and the diff
+                    // card this mirrors separates its body the same way.
+                    this.p_2()
+                        .border_t_1()
+                        .border_color(self.tool_card_border_color(cx))
+                } else {
+                    this.ml(rems(0.4))
+                        .px_3p5()
+                        .border_l_1()
+                        .border_color(self.tool_card_border_color(cx))
+                }
+            })
+            .child(self.render_markdown(markdown, style, cx))
             .into_any_element()
     }
 

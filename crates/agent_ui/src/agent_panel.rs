@@ -7329,13 +7329,13 @@ mod tests {
         let disclosure = cx
             .debug_bounds("execute-tool-output-disclosure-0")
             .expect("collapsed execute tool source should expose a disclosure");
-        let copy_button = cx
-            .debug_bounds("inner-tool-call-header-0-copy-command")
-            .expect("execute tool source should expose a copy button");
-        assert!(
-            !copy_button.intersects(&disclosure),
-            "execute tool copy and disclosure controls should not overlap"
-        );
+        // The header no longer carries its own copy button; asserting the old
+        // selector's absence would pass no matter what, since nothing renders
+        // it. What still matters is that the disclosure is reachable and works.
+        // The disclosure is hover-revealed like a code block's copy button, so
+        // it only takes a click once the pointer is over the card.
+        cx.simulate_mouse_move(disclosure.center(), None, Modifiers::default());
+        cx.run_until_parked();
         cx.simulate_click(disclosure.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(
