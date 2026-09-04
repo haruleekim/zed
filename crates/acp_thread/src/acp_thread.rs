@@ -272,6 +272,41 @@ pub fn sandbox_not_applied_from_meta(meta: &Option<acp::Meta>) -> Option<Sandbox
         .and_then(|v| serde_json::from_value(v.clone()).ok())
 }
 
+/// Meta key marking a tool call as an advisor intervention rather than a tool
+/// the agent ran. Advisors are a second voice in a session: they interrupt the
+/// agent mid-turn, so their notes are often the only stated reason a turn
+/// changed direction. The value is the list of notes the card renders.
+pub const ADVISOR_NOTES_META_KEY: &str = "advisor_notes";
+
+/// One advisor note, in the order the card renders them.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AdvisorNote {
+    pub note: String,
+    /// `nit`, `concern` or `blocker`; absent when the advisor left it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<String>,
+    /// Which configured advisor produced the note; absent for the default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<String>,
+}
+
+pub fn meta_with_advisor_notes(notes: &[AdvisorNote]) -> acp::Meta {
+    acp::Meta::from_iter([(
+        ADVISOR_NOTES_META_KEY.into(),
+        serde_json::to_value(notes).unwrap_or_default(),
+    )])
+}
+
+/// Notes off an advisor card. An empty list is treated as absent: a card with
+/// nothing to say must not claim advisor chrome.
+pub fn advisor_notes_from_meta(meta: &Option<acp::Meta>) -> Option<Vec<AdvisorNote>> {
+    let notes: Vec<AdvisorNote> = meta
+        .as_ref()
+        .and_then(|m| m.get(ADVISOR_NOTES_META_KEY))
+        .and_then(|value| serde_json::from_value(value.clone()).ok())?;
+    (!notes.is_empty()).then_some(notes)
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SubagentSessionInfo {
     /// The session id of the subagent sessiont that was spawned
@@ -980,6 +1015,9 @@ pub struct ToolCall {
     pub raw_output: Option<serde_json::Value>,
     pub raw_output_markdown: Option<Entity<Markdown>>,
     pub tool_name: Option<SharedString>,
+    /// Notes when this card is an advisor intervention rather than a tool the
+    /// agent ran (see [`ADVISOR_NOTES_META_KEY`]).
+    pub advisor_notes: Option<Vec<AdvisorNote>>,
     pub subagent_session_info: Option<SubagentSessionInfo>,
     pub background_job_info: Option<BackgroundJobInfo>,
     pub background_process_info: Option<BackgroundProcessInfo>,
@@ -1032,6 +1070,7 @@ impl ToolCall {
             .and_then(|output| markdown_for_raw_output(output, &language_registry, cx));
 
         let tool_name = tool_name_from_meta(&tool_call.meta);
+        let advisor_notes = advisor_notes_from_meta(&tool_call.meta);
 
         let subagent_session_info = subagent_session_info_from_meta(&tool_call.meta);
         let background_job_info = background_job_info_from_meta(&tool_call.meta);
@@ -1061,6 +1100,7 @@ impl ToolCall {
             raw_output: tool_call.raw_output,
             raw_output_markdown,
             tool_name,
+            advisor_notes,
             subagent_session_info,
             background_job_info,
             background_process_info,
@@ -3307,6 +3347,7 @@ impl AcpThread {
                     raw_output: None,
                     raw_output_markdown: None,
                     tool_name: None,
+                    advisor_notes: None,
                     subagent_session_info: None,
                     background_job_info: None,
                     background_process_info: None,
@@ -5067,6 +5108,50 @@ mod tests {
             assert!(background_job_info_from_meta(&meta).is_none());
             assert!(background_process_info_from_meta(&meta).is_none());
         }
+    }
+
+    #[test]
+    fn advisor_notes_meta_round_trips_and_treats_an_empty_list_as_absent() {
+        let notes = vec![
+            AdvisorNote {
+                note: "Use the repo script".to_string(),
+                severity: Some("concern".to_string()),
+                advisor: Some("reviewer".to_string()),
+            },
+            AdvisorNote {
+                note: "Stray whitespace".to_string(),
+                severity: None,
+                advisor: None,
+            },
+        ];
+        let decoded = advisor_notes_from_meta(&Some(meta_with_advisor_notes(&notes)))
+            .expect("advisor notes should survive the wire");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].severity.as_deref(), Some("concern"));
+        assert_eq!(decoded[0].advisor.as_deref(), Some("reviewer"));
+        assert_eq!(decoded[1].note, "Stray whitespace");
+        assert_eq!(decoded[1].severity, None);
+
+        // The shape the agent actually sends: optional keys are omitted, not
+        // null, and a note with only text is still a note.
+        let sparse = acp::Meta::from_iter([(
+            ADVISOR_NOTES_META_KEY.into(),
+            json!([{ "note": "no severity here" }]),
+        )]);
+        let sparse = advisor_notes_from_meta(&Some(sparse))
+            .expect("a note carrying only its text should decode");
+        assert_eq!(sparse[0].note, "no severity here");
+        assert_eq!(sparse[0].severity, None);
+
+        // An empty list must read as absent: presence is what earns a card the
+        // advisor icon and its expanded-on-arrival note, and a card with
+        // nothing to say has not intervened.
+        let empty = acp::Meta::from_iter([(ADVISOR_NOTES_META_KEY.into(), json!([]))]);
+        assert!(advisor_notes_from_meta(&Some(empty)).is_none());
+        let malformed =
+            acp::Meta::from_iter([(ADVISOR_NOTES_META_KEY.into(), json!({ "note": "n" }))]);
+        assert!(advisor_notes_from_meta(&Some(malformed)).is_none());
+        assert!(advisor_notes_from_meta(&None).is_none());
     }
 
     #[gpui::test]

@@ -9,10 +9,10 @@ use agent_client_protocol::schema::v1 as acp;
 use std::cell::RefCell;
 
 use acp_thread::{
-    BackgroundJobInfo, BackgroundJobStatus, BackgroundProcessInfo, BackgroundProcessState,
-    BackgroundWorkTarget, Elicitation, ElicitationEntryId, ElicitationStatus, PlanEntry,
-    SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails, SandboxNotAppliedReason,
-    decode_path_escapes,
+    AdvisorNote, BackgroundJobInfo, BackgroundJobStatus, BackgroundProcessInfo,
+    BackgroundProcessState, BackgroundWorkTarget, Elicitation, ElicitationEntryId,
+    ElicitationStatus, PlanEntry, SandboxAuthorizationDetails, SandboxFallbackAuthorizationDetails,
+    SandboxNotAppliedReason, decode_path_escapes,
 };
 use agent::{
     SandboxStatusKey, SandboxStatusRefresh, SkillLoadingIssue, SkillLoadingIssueKind,
@@ -951,6 +951,25 @@ fn tool_call_source_runtime(content: &[ToolCallContent]) -> SourceRuntime {
         })
         .find_map(|(resource, _)| tool_source_resource_runtime(resource))
         .unwrap_or(UNNAMED_SOURCE_RUNTIME)
+}
+
+/// Strongest severity across an advisory's notes, colored the way the agent's
+/// own terminal card colors its severity rail: a blocker reads as an error, a
+/// concern as a warning, anything else stays chrome.
+fn advisory_severity_color(notes: &[AdvisorNote]) -> Color {
+    if notes
+        .iter()
+        .any(|note| note.severity.as_deref() == Some("blocker"))
+    {
+        return Color::Error;
+    }
+    if notes
+        .iter()
+        .any(|note| note.severity.as_deref() == Some("concern"))
+    {
+        return Color::Warning;
+    }
+    Color::Muted
 }
 
 impl ToolCallLayout {
@@ -10535,6 +10554,14 @@ impl ThreadView {
                 .into_any_element()
         } else if is_file {
             div().child(file_icon).into_any_element()
+        } else if let Some(notes) = tool_call.advisor_notes.as_deref() {
+            // An advisory is a second voice, not a tool the agent ran: name it
+            // with a warning tinted by the strongest note, matching how the
+            // agent's own terminal UI colors its advisor rail.
+            Icon::new(IconName::Warning)
+                .size(IconSize::Small)
+                .color(advisory_severity_color(notes))
+                .into_any_element()
         } else if is_subagent_tool_call {
             Icon::new(self.agent_icon)
                 .size(IconSize::Small)
@@ -13716,6 +13743,34 @@ mod tests {
             UNNAMED_SOURCE_RUNTIME
         );
         assert_eq!(tool_call_source_runtime(&[]), UNNAMED_SOURCE_RUNTIME);
+    }
+
+    #[test]
+    fn advisory_icon_color_follows_the_strongest_note() {
+        let note = |severity: Option<&str>| AdvisorNote {
+            note: "n".to_string(),
+            severity: severity.map(str::to_string),
+            advisor: None,
+        };
+
+        // A batch is named by its worst note: a blocker buried under nits must
+        // not read as chrome.
+        assert_eq!(
+            advisory_severity_color(&[
+                note(Some("nit")),
+                note(Some("blocker")),
+                note(Some("concern"))
+            ]),
+            Color::Error
+        );
+        assert_eq!(
+            advisory_severity_color(&[note(Some("nit")), note(Some("concern"))]),
+            Color::Warning
+        );
+        assert_eq!(
+            advisory_severity_color(&[note(Some("nit")), note(None)]),
+            Color::Muted
+        );
     }
 }
 

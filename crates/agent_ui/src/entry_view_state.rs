@@ -51,6 +51,9 @@ pub struct EntryViewState {
     expanded_compactions: HashSet<usize>,
     expanded_tool_calls: HashSet<acp::ToolCallId>,
     initialized_execute_resource_expansion: HashSet<acp::ToolCallId>,
+    /// Advisory cards arrive expanded once, so the note that interrupted the
+    /// agent is readable without a click; collapsing one keeps it collapsed.
+    initialized_advisory_expansion: HashSet<acp::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -74,6 +77,7 @@ impl EntryViewState {
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
             initialized_execute_resource_expansion: HashSet::default(),
+            initialized_advisory_expansion: HashSet::default(),
         }
     }
 
@@ -302,6 +306,13 @@ impl EntryViewState {
                     && self
                         .initialized_execute_resource_expansion
                         .insert(id.clone())
+                {
+                    self.expanded_tool_calls.insert(id.clone());
+                }
+                // An advisory whose note is hidden behind a chevron may as well
+                // not have been delivered: the note *is* the card.
+                if tool_call.advisor_notes.is_some()
+                    && self.initialized_advisory_expansion.insert(id.clone())
                 {
                     self.expanded_tool_calls.insert(id.clone());
                 }

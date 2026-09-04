@@ -7345,6 +7345,86 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_advisory_card_arrives_with_its_note_visible(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            agent::ThreadStore::init_global(cx);
+            language_model::LanguageModelRegistry::test(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |multi_workspace, _cx| {
+                multi_workspace.workspace().clone()
+            })
+            .unwrap();
+        let cx = &mut VisualTestContext::from_window(multi_workspace.into(), cx);
+        cx.simulate_resize(size(px(900.), px(700.)));
+
+        let connection = StubAgentConnection::new();
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| AgentPanel::new(workspace, window, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace.focus_panel::<AgentPanel>(window, cx);
+            panel
+        });
+        open_thread_with_connection(&panel, connection.clone(), cx);
+
+        let session_id = active_session_id(&panel, cx);
+        let tool_call_id = acp::ToolCallId::new("advisor-1");
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp::SessionUpdate::ToolCall(
+                    acp::ToolCall::new(tool_call_id.clone(), "Advisor · concern")
+                        .kind(acp::ToolKind::Think)
+                        .status(acp::ToolCallStatus::Completed)
+                        .content(vec![acp::ToolCallContent::Content(acp::Content::new(
+                            acp::ContentBlock::from("> **concern** — Use the repo script"),
+                        ))])
+                        .meta(acp_thread::meta_with_advisor_notes(&[
+                            acp_thread::AdvisorNote {
+                                note: "Use the repo script".to_string(),
+                                severity: Some("concern".to_string()),
+                                advisor: None,
+                            },
+                        ])),
+                ),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+
+        // The note is the card: an advisory delivered collapsed would hide the
+        // reason the agent changed course behind a chevron nobody clicks.
+        assert!(
+            cx.debug_bounds("tool-call-output-0-0").is_some(),
+            "an advisory should arrive with its note visible"
+        );
+        // A second update to the same card must not re-expand it either: the
+        // latch fires once so a reader who collapses an advisory keeps it that
+        // way for the rest of the session.
+        cx.update(|_window, cx| {
+            connection.send_update(
+                session_id,
+                acp::SessionUpdate::ToolCallUpdate(acp::ToolCallUpdate::new(
+                    tool_call_id,
+                    acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::Completed),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("tool-call-output-0-0").is_some(),
+            "an advisory should keep its note visible across updates"
+        );
+    }
+
+    #[gpui::test]
     async fn test_multi_file_acp_diffs_render_without_raw_preview_duplicates(
         cx: &mut TestAppContext,
     ) {
