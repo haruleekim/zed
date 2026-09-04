@@ -815,6 +815,42 @@ fn background_process_elapsed_ms(info: &BackgroundProcessInfo, now_ms: u64) -> O
     Some(info.exited_at.unwrap_or(now_ms).saturating_sub(started_at))
 }
 
+/// Body markdown for a background work card.
+///
+/// The agent's own content blocks come first: `raw_output` is the tool result
+/// payload, and for a background job that is the internal envelope (async
+/// state, ids, flags) which renders as a wall of JSON. Agents that send no
+/// content still get their raw payload rather than an empty card.
+///
+/// Embedded resources are skipped: on these cards they are the *source of the
+/// call* (the shell command, an eval cell) which agents prepend before the
+/// result, and the header already names the call. Every remaining visible
+/// block is returned so trailing notices survive — `raw_output` used to carry
+/// them, and taking only the first block would drop them.
+fn background_card_output(
+    content: &[ToolCallContent],
+    raw_output_markdown: Option<&Entity<Markdown>>,
+    cx: &App,
+) -> Vec<Entity<Markdown>> {
+    let blocks: Vec<Entity<Markdown>> = content
+        .iter()
+        .filter_map(|content| match content {
+            ToolCallContent::ContentBlock(block) if block.embedded_resource().is_none() => block
+                .visible_content(cx)
+                .then(|| block.markdown())
+                .flatten(),
+            ToolCallContent::ContentBlock(_)
+            | ToolCallContent::Diff(_)
+            | ToolCallContent::Terminal(_) => None,
+        })
+        .cloned()
+        .collect();
+    if !blocks.is_empty() {
+        return blocks;
+    }
+    raw_output_markdown.cloned().into_iter().collect()
+}
+
 impl ToolCallLayout {
     /// Stable discriminant used to disambiguate element ids when the same tool
     /// call is rendered in more than one layout at once (e.g. inline in the
@@ -8301,7 +8337,12 @@ impl ThreadView {
         } else {
             SharedString::from(title)
         };
-        let has_output = tool_call.raw_output_markdown.is_some();
+        let output_markdown = background_card_output(
+            &tool_call.content,
+            tool_call.raw_output_markdown.as_ref(),
+            cx,
+        );
+        let has_output = !output_markdown.is_empty();
         let is_expanded = has_output
             && self
                 .entry_view_state
@@ -8448,33 +8489,36 @@ impl ThreadView {
             .bg(cx.theme().colors().editor_background)
             .overflow_hidden()
             .child(header)
-            .when_some(
-                is_expanded
-                    .then(|| tool_call.raw_output_markdown.clone())
-                    .flatten(),
-                |this, output| {
-                    this.child(
-                        div()
-                            .id(("background-tool-output", entry_ix))
-                            .w_full()
-                            .p_2()
-                            .border_t_1()
-                            .border_color(self.tool_card_border_color(cx))
-                            .map(|this| {
-                                if layout == ToolCallLayout::Floating {
-                                    this.max_h_40().overflow_y_scroll()
-                                } else {
-                                    this
-                                }
-                            })
-                            .child(self.render_markdown(
-                                output,
-                                MarkdownStyle::themed(MarkdownFont::Agent, window, cx),
-                                cx,
-                            )),
-                    )
-                },
-            )
+            .when(is_expanded, |this| {
+                // The card is narrow and clips (`overflow_hidden` above), so a
+                // horizontally scrolling code block puts long lines — a job's
+                // one-line JSON result, a wide log — outside the card with no
+                // way to reach them. Soft-wrap instead, as the command header
+                // already does.
+                let mut style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                style.code_block_overflow_x_scroll = false;
+                this.child(
+                    v_flex()
+                        .id(("background-tool-output", entry_ix))
+                        .w_full()
+                        .gap_1()
+                        .p_2()
+                        .border_t_1()
+                        .border_color(self.tool_card_border_color(cx))
+                        .map(|this| {
+                            if layout == ToolCallLayout::Floating {
+                                this.max_h_40().overflow_y_scroll()
+                            } else {
+                                this
+                            }
+                        })
+                        .children(
+                            output_markdown
+                                .into_iter()
+                                .map(|output| self.render_markdown(output, style.clone(), cx)),
+                        ),
+                )
+            })
             .when(layout == ToolCallLayout::Standalone, |this| {
                 this.my_1p5().ml_5().mr_5()
             })
@@ -13391,6 +13435,107 @@ mod tests {
         assert_eq!(background_process_elapsed_ms(&process, 2_000), Some(400));
         process.started_at = None;
         assert_eq!(background_process_elapsed_ms(&process, 2_000), None);
+    }
+
+    #[gpui::test]
+    fn background_card_prefers_agent_content_over_the_raw_payload(cx: &mut gpui::TestAppContext) {
+        // `raw_output` for a background job is the tool result envelope, which
+        // rendered as a JSON wall in the expanded card. The agent also sends a
+        // human sentence as content; that is what belongs in the body.
+        let (content_markdown, raw_markdown) = cx.update(|cx| {
+            (
+                cx.new(|cx| {
+                    Markdown::new("Started `bash loop` as job bg_1.".into(), None, None, cx)
+                }),
+                cx.new(|cx| {
+                    Markdown::new(
+                        "```json\n{ \"details\": { \"async\": { \"jobId\": \"bg_1\" } } }\n```"
+                            .into(),
+                        None,
+                        None,
+                        cx,
+                    )
+                }),
+            )
+        });
+
+        cx.update(|cx| {
+            let source_markdown =
+                cx.new(|cx| Markdown::new("```sh\nbun -e 'x'\n```".into(), None, None, cx));
+            let notice_markdown =
+                cx.new(|cx| Markdown::new("(output truncated)".into(), None, None, cx));
+            let sources = |markdown: Entity<Markdown>| {
+                ToolCallContent::ContentBlock(acp_thread::ContentBlock::EmbeddedResource {
+                    resource: acp::EmbeddedResource::new(
+                        acp::EmbeddedResourceResource::TextResourceContents(
+                            acp::TextResourceContents::new(
+                                "bun -e 'x'",
+                                "omp-shell://tool/t/command.sh",
+                            )
+                            .mime_type("text/x-shellscript".to_string()),
+                        ),
+                    ),
+                    markdown: Some(markdown),
+                })
+            };
+
+            // The command source is prepended by the agent; it is the call, not
+            // its output, so the body must skip it and keep every text block.
+            let job_content = vec![
+                sources(source_markdown.clone()),
+                ToolCallContent::ContentBlock(acp_thread::ContentBlock::Markdown {
+                    markdown: content_markdown.clone(),
+                }),
+                ToolCallContent::ContentBlock(acp_thread::ContentBlock::Markdown {
+                    markdown: notice_markdown.clone(),
+                }),
+            ];
+            let chosen = background_card_output(&job_content, Some(&raw_markdown), cx);
+            assert_eq!(
+                chosen
+                    .iter()
+                    .map(|markdown| markdown.read(cx).source().to_string())
+                    .collect::<Vec<_>>(),
+                vec![
+                    content_markdown.read(cx).source().to_string(),
+                    notice_markdown.read(cx).source().to_string(),
+                ]
+            );
+
+            // A card whose only content is the call source falls back to the
+            // payload rather than echoing the command as its own output.
+            let only_source = vec![sources(source_markdown)];
+            let source_only = background_card_output(&only_source, Some(&raw_markdown), cx);
+            assert_eq!(
+                source_only
+                    .iter()
+                    .map(|markdown| markdown.read(cx).source().to_string())
+                    .collect::<Vec<_>>(),
+                vec![raw_markdown.read(cx).source().to_string()]
+            );
+
+            // No content at all: the raw payload is better than an empty card.
+            let fallback = background_card_output(&[], Some(&raw_markdown), cx);
+            assert_eq!(fallback.len(), 1);
+            assert_eq!(
+                fallback[0].read(cx).source(),
+                raw_markdown.read(cx).source()
+            );
+
+            // Blank content must not win over the payload either.
+            let blank = cx.new(|cx| Markdown::new("   ".into(), None, None, cx));
+            let with_blank = vec![ToolCallContent::ContentBlock(
+                acp_thread::ContentBlock::Markdown { markdown: blank },
+            )];
+            let chosen_blank = background_card_output(&with_blank, Some(&raw_markdown), cx);
+            assert_eq!(chosen_blank.len(), 1);
+            assert_eq!(
+                chosen_blank[0].read(cx).source(),
+                raw_markdown.read(cx).source()
+            );
+
+            assert!(background_card_output(&[], None, cx).is_empty());
+        });
     }
 }
 
