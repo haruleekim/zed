@@ -1632,15 +1632,43 @@ impl ContentBlock {
         }
     }
 
-    /// Updates a Markdown block in place from a streaming text `block`, reusing
-    /// the existing `Markdown` entity rather than recreating it. Appends only the
-    /// new suffix when the update is a continuation (the common streaming case),
-    /// otherwise re-sets the source. Returns `false` when an in-place update isn't
-    /// applicable, so the caller can fall back to replacing the block wholesale.
+    /// Updates a Markdown or text-resource block in place from a streaming
+    /// `block`, reusing the existing `Markdown` entity rather than recreating
+    /// it. Appends only the new suffix when a text update is a continuation
+    /// (the common streaming case), otherwise re-sets the source. Returns
+    /// `false` when an in-place update isn't applicable, so the caller can fall
+    /// back to replacing the block wholesale.
     ///
     /// Recreating the entity on every streamed snapshot causes the rendered
-    /// element to tear down and rebuild, which flickers badly.
+    /// element to tear down and rebuild, which flickers badly. Streaming
+    /// command output arrives as a `text/plain` resource (so the client renders
+    /// it preformatted rather than as Markdown), which has to be updated in
+    /// place for the same reason — the fenced source is rebuilt wholesale
+    /// because its closing fence makes the new text no suffix of the old.
     pub fn update_text_in_place(&mut self, block: &acp::ContentBlock, cx: &mut App) -> bool {
+        if let (
+            ContentBlock::EmbeddedResource {
+                resource: current,
+                markdown: Some(markdown),
+            },
+            acp::ContentBlock::Resource(incoming),
+        ) = (&mut *self, block)
+            && let (
+                acp::EmbeddedResourceResource::TextResourceContents(current_text),
+                acp::EmbeddedResourceResource::TextResourceContents(incoming_text),
+            ) = (&current.resource, &incoming.resource)
+            && current_text.uri == incoming_text.uri
+            && current_text.mime_type == incoming_text.mime_type
+        {
+            let source = Self::text_resource_markdown(incoming_text);
+            markdown.update(cx, |markdown, cx| {
+                if markdown.source().as_ref() != source {
+                    markdown.reset(source.into(), cx);
+                }
+            });
+            *current = incoming.clone();
+            return true;
+        }
         let ContentBlock::Markdown { markdown } = self else {
             return false;
         };
@@ -5416,6 +5444,67 @@ mod tests {
             );
             assert_eq!(untyped.to_markdown(cx), "```\n# plain preview\n```");
             assert_eq!(untyped.text_content(cx), Some("# plain preview"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_streaming_text_resource_reuses_its_markdown_entity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            let language_registry =
+                Arc::new(LanguageRegistry::test(cx.background_executor().clone()));
+            let output = |text: &str, uri: &str| {
+                acp::ContentBlock::Resource(acp::EmbeddedResource::new(
+                    acp::EmbeddedResourceResource::TextResourceContents(
+                        acp::TextResourceContents::new(text, uri)
+                            .mime_type("text/plain".to_string()),
+                    ),
+                ))
+            };
+
+            let mut block = ContentBlock::new_tool_call_content(
+                output("first line\n", "omp-output://tool/t/output-0.txt"),
+                &language_registry,
+                PathStyle::local(),
+                cx,
+            );
+            let entity = block
+                .markdown()
+                .expect("a text resource renders markdown")
+                .clone();
+
+            // Command output streams as a growing snapshot of the same
+            // resource. Rebuilding the entity per snapshot tears the rendered
+            // element down and flickers, so the update must land in place.
+            assert!(block.update_text_in_place(
+                &output(
+                    "first line\nsecond line\n",
+                    "omp-output://tool/t/output-0.txt"
+                ),
+                cx
+            ));
+            assert_eq!(
+                block.markdown().map(|markdown| markdown.entity_id()),
+                Some(entity.entity_id())
+            );
+            assert_eq!(
+                entity.read(cx).source(),
+                "```\nfirst line\nsecond line\n```"
+            );
+
+            // A different resource is a different block: updating in place
+            // would silently overwrite unrelated output.
+            assert!(
+                !block
+                    .update_text_in_place(&output("other", "omp-output://tool/t/output-1.txt"), cx)
+            );
+            assert_eq!(
+                entity.read(cx).source(),
+                "```\nfirst line\nsecond line\n```"
+            );
         });
     }
 

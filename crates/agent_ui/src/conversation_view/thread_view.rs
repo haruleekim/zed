@@ -822,11 +822,13 @@ fn background_process_elapsed_ms(info: &BackgroundProcessInfo, now_ms: u64) -> O
 /// state, ids, flags) which renders as a wall of JSON. Agents that send no
 /// content still get their raw payload rather than an empty card.
 ///
-/// Embedded resources are skipped: on these cards they are the *source of the
-/// call* (the shell command, an eval cell) which agents prepend before the
-/// result, and the header already names the call. Every remaining visible
-/// block is returned so trailing notices survive — `raw_output` used to carry
-/// them, and taking only the first block would drop them.
+/// *Call-source* resources are skipped: on these cards they are the command
+/// or eval cell the agent prepends before the result, and the header already
+/// names the call. Any other resource is kept — a background command's own
+/// output arrives as a preformatted resource, and dropping it left the card
+/// with nothing but the JSON payload. Every remaining visible block is
+/// returned so trailing notices survive; taking only the first would drop
+/// them.
 fn background_card_output(
     content: &[ToolCallContent],
     raw_output_markdown: Option<&Entity<Markdown>>,
@@ -835,13 +837,19 @@ fn background_card_output(
     let blocks: Vec<Entity<Markdown>> = content
         .iter()
         .filter_map(|content| match content {
-            ToolCallContent::ContentBlock(block) if block.embedded_resource().is_none() => block
-                .visible_content(cx)
-                .then(|| block.markdown())
-                .flatten(),
-            ToolCallContent::ContentBlock(_)
-            | ToolCallContent::Diff(_)
-            | ToolCallContent::Terminal(_) => None,
+            ToolCallContent::ContentBlock(block) => {
+                if block
+                    .embedded_resource()
+                    .is_some_and(|(resource, _)| is_tool_source_resource(resource))
+                {
+                    return None;
+                }
+                block
+                    .visible_content(cx)
+                    .then(|| block.markdown())
+                    .flatten()
+            }
+            ToolCallContent::Diff(_) | ToolCallContent::Terminal(_) => None,
         })
         .cloned()
         .collect();
@@ -929,14 +937,30 @@ fn is_tool_source_resource(resource: &acp::EmbeddedResource) -> bool {
 }
 
 fn tool_source_resource_runtime(resource: &acp::EmbeddedResource) -> Option<SourceRuntime> {
-    let acp::EmbeddedResourceResource::TextResourceContents(text) = &resource.resource else {
-        return None;
-    };
-    let mime_type = text.mime_type.as_deref()?;
+    let mime_type = text_resource_mime(resource)?;
     TOOL_SOURCE_RUNTIMES
         .iter()
         .find(|(candidate, _)| *candidate == mime_type)
         .map(|(_, runtime)| *runtime)
+}
+
+fn text_resource_mime(resource: &acp::EmbeddedResource) -> Option<&str> {
+    match &resource.resource {
+        acp::EmbeddedResourceResource::TextResourceContents(text) => text.mime_type.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether a resource is bytes that were *printed* rather than prose that was
+/// authored, and so must render verbatim: filling the card, soft-wrapped, with
+/// no nested code-block frame.
+///
+/// Call source qualifies, and so does `text/plain` — how an agent hands over
+/// console output. Rendering that as Markdown ate the punctuation logs are
+/// made of and boxed the result in a scrolling frame inside a card that
+/// already is one.
+fn is_preformatted_resource(resource: &acp::EmbeddedResource) -> bool {
+    is_tool_source_resource(resource) || text_resource_mime(resource) == Some("text/plain")
 }
 
 /// Names the runtime an execute card ran its source in. The source resource
@@ -10808,8 +10832,8 @@ impl ThreadView {
         cx: &Context<Self>,
     ) -> AnyElement {
         if let Some(markdown) = markdown {
-            if is_tool_source_resource(resource) {
-                return self.render_tool_source_section(markdown, card_layout, window, cx);
+            if is_preformatted_resource(resource) {
+                return self.render_preformatted_section(markdown, card_layout, window, cx);
             }
             return self.render_markdown_output(
                 markdown,
@@ -10853,12 +10877,16 @@ impl ThreadView {
             .into_any_element()
     }
 
-    /// Render call source as a card section, the way a diff card renders its
-    /// hunks: a divider separates it from the header, the code fills the card
-    /// width, and long lines soft-wrap. The nested code-block frame (its own
-    /// background, padding and rounded corners) is dropped — the card already
-    /// provides one, and inside it the frame clipped wide commands.
-    fn render_tool_source_section(
+    /// Render printed bytes as a card section, the way a diff card renders its
+    /// hunks: a divider separates it from what came before, the text fills the
+    /// card width, and long lines soft-wrap. The nested code-block frame (its
+    /// own background, padding and rounded corners) is dropped — the card
+    /// already provides one, and inside it the frame clipped wide commands and
+    /// boxed output in a second scrolling panel.
+    ///
+    /// Used for both halves of a console card: the source that ran and the
+    /// output it printed, so they read as one continuous transcript.
+    fn render_preformatted_section(
         &self,
         markdown: Entity<Markdown>,
         card_layout: bool,
@@ -13663,7 +13691,7 @@ mod tests {
 
             // A card whose only content is the call source falls back to the
             // payload rather than echoing the command as its own output.
-            let only_source = vec![sources(source_markdown)];
+            let only_source = vec![sources(source_markdown.clone())];
             let source_only = background_card_output(&only_source, Some(&raw_markdown), cx);
             assert_eq!(
                 source_only
@@ -13671,6 +13699,34 @@ mod tests {
                     .map(|markdown| markdown.read(cx).source().to_string())
                     .collect::<Vec<_>>(),
                 vec![raw_markdown.read(cx).source().to_string()]
+            );
+
+            // A background command's own output arrives as a preformatted
+            // resource, not a text block. Dropping every resource left these
+            // cards showing nothing but the JSON payload.
+            let output_markdown =
+                cx.new(|cx| Markdown::new("```\nASYNC-DONE\n```".into(), None, None, cx));
+            let output =
+                ToolCallContent::ContentBlock(acp_thread::ContentBlock::EmbeddedResource {
+                    resource: acp::EmbeddedResource::new(
+                        acp::EmbeddedResourceResource::TextResourceContents(
+                            acp::TextResourceContents::new(
+                                "ASYNC-DONE",
+                                "omp-output://tool/t/output-0.txt",
+                            )
+                            .mime_type("text/plain".to_string()),
+                        ),
+                    ),
+                    markdown: Some(output_markdown.clone()),
+                });
+            let with_output = vec![sources(source_markdown.clone()), output];
+            let rendered = background_card_output(&with_output, Some(&raw_markdown), cx);
+            assert_eq!(
+                rendered
+                    .iter()
+                    .map(|markdown| markdown.read(cx).source().to_string())
+                    .collect::<Vec<_>>(),
+                vec![output_markdown.read(cx).source().to_string()]
             );
 
             // No content at all: the raw payload is better than an empty card.
@@ -13743,6 +13799,43 @@ mod tests {
             UNNAMED_SOURCE_RUNTIME
         );
         assert_eq!(tool_call_source_runtime(&[]), UNNAMED_SOURCE_RUNTIME);
+    }
+
+    #[test]
+    fn console_output_renders_verbatim_without_claiming_to_be_call_source() {
+        let resource = |mime: Option<&str>| {
+            let text =
+                acp::TextResourceContents::new("| ok | 3 |", "omp-output://tool/t/output-0.txt");
+            acp::EmbeddedResource::new(acp::EmbeddedResourceResource::TextResourceContents(
+                match mime {
+                    Some(mime) => text.mime_type(mime.to_string()),
+                    None => text,
+                },
+            ))
+        };
+
+        // Printed bytes render as a flush card section, like the source above
+        // them, instead of as Markdown inside a nested scrolling frame.
+        assert!(is_preformatted_resource(&resource(Some("text/plain"))));
+        assert!(is_preformatted_resource(&resource(Some("text/x-python"))));
+
+        // Output is not *source*, though: only source names the card's runtime
+        // and only source is dropped from a background card's body.
+        assert!(!is_tool_source_resource(&resource(Some("text/plain"))));
+        assert_eq!(
+            tool_call_source_runtime(&[ToolCallContent::ContentBlock(
+                acp_thread::ContentBlock::EmbeddedResource {
+                    resource: resource(Some("text/plain")),
+                    markdown: None,
+                }
+            )]),
+            UNNAMED_SOURCE_RUNTIME
+        );
+
+        // Authored Markdown (a plan review card) stays prose, and a resource
+        // that declares no type is not assumed to be printed output.
+        assert!(!is_preformatted_resource(&resource(Some("text/markdown"))));
+        assert!(!is_preformatted_resource(&resource(None)));
     }
 
     #[test]
